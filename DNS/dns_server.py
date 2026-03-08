@@ -5,6 +5,7 @@ import dns.resolver
 from dnslib import DNSRecord
 import os
 
+#---get ip from os for server---
 def get_dynamic_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -16,6 +17,7 @@ def get_dynamic_ip():
         s.close()
     return ip
 
+#---configuration - needs to be externelized---
 HOST = get_dynamic_ip()
 PORT = 53
 UPSTREAM_DNS = '8.8.8.8'
@@ -24,10 +26,12 @@ SOCKET_TIMEOUT = 3.0
 CACHE_CLEAN_INTERVAL = 300
 LOG_FILE = "DNS.log"
 
+#thread-safe cache: {(qname, qtype): (raw_response_bytes, expiry_timestamp)}
 cache = {}
 cache_lock = threading.Lock()
 log_lock = threading.Lock()
 
+#20 global dns servers for propagation testing
 GLOBAL_SERVERS = {
     "Google Primary": "8.8.8.8",
     "Google Secondary": "8.8.4.4",
@@ -51,6 +55,7 @@ GLOBAL_SERVERS = {
     "Verisign Secondary": "64.6.65.6"
 }
 
+#---log function---
 def log(message):
     with log_lock:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -58,6 +63,7 @@ def log(message):
         with open(LOG_FILE, "a") as f:
             f.write(entry + "\n")
 
+#---cache cleaner every x seconds---
 def cache_cleaner():
     while True:
         time.sleep(CACHE_CLEAN_INTERVAL)
@@ -73,6 +79,7 @@ def cache_cleaner():
         else:
             log("cache cleanup run (no entries removed)")
 
+#---core server logic---
 def forward_query(data):
     try:
         log("forwarding query to upstream dns")
@@ -96,29 +103,35 @@ def handle_client(data, addr, server_socket):
 
         log(f"DNS Request: {qname} from {addr[0]}")
 
+        #1. check cache
         with cache_lock:
             if (qname, qtype) in cache:
                 raw_resp, expiry = cache[(qname, qtype)]
                 if time.time() < expiry:
+                    #cache hit: rewrite transaction id to match the client's request
                     cached_resp = DNSRecord.parse(raw_resp)
                     cached_resp.header.id = request.header.id
                     server_socket.sendto(cached_resp.pack(), addr)
                     return
                 else:
+                    #cache expired
                     del cache[(qname, qtype)]
 
+        #2. cache miss: forward to upstream
         response_data = forward_query(data)
         if not response_data:
-            return
+            return #upstream timeout, drop request
 
         response_record = DNSRecord.parse(response_data)
-        ttl = 60
+        #3. extract ttl and update cache
+        ttl = 60 #default ttl if none found
         if response_record.rr:
             ttl = min([rr.ttl for rr in response_record.rr])
 
         with cache_lock:
             cache[(qname, qtype)] = (response_data, time.time() + ttl)
 
+        #4. send back to client
         server_socket.sendto(response_data, addr)
     except Exception as e:
         log(f"error handling request from {addr}: {e}")
@@ -141,6 +154,7 @@ def run_dns_server():
         except Exception as e:
             log(f"server error: {e}")
 
+#---propagation engine---
 def run_propagation_test(domain):
     log(f"starting propagation test for {domain}")
     print(f"\n--- propagation test: {domain} ---")
@@ -164,6 +178,7 @@ def run_propagation_test(domain):
     print("-" * 55)
     log(f"propagation test complete for {domain}")
 
+#---main cli interface---
 if __name__ == "__main__":
     cleanup_thread = threading.Thread(target=cache_cleaner)
     cleanup_thread.daemon = True
