@@ -157,7 +157,7 @@ class PortableRogueDHCP:
     # ==========================================
 
     def phase_1_recon(self):
-        print("[*] PHASE 1: Network Reconnaissance")
+        print("[*] PHASE 1: DHCP Network Reconnaissance")
         probe_mac_str = self.generate_mac()
         probe_mac_bytes = mac2str(probe_mac_str)
         probe_packet = self.build_heist_request(probe_mac_str, probe_mac_bytes, random.randint(1, 900000000))
