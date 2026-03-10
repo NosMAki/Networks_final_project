@@ -3,10 +3,12 @@ import ssl
 import os
 import time
 import hashlib
-from shared import send_msg, recv_msg, TCPDataConnection, CONTROL_PORT, BUFFER_SIZE
+# Added RUDPDataConnection to the import list
+from shared import send_msg, recv_msg, TCPDataConnection, RUDPDataConnection, CONTROL_PORT, BUFFER_SIZE
 
 CLIENT_DATA_DIR = "./client_data"
 SERVER_IP = 'YOUR_PUBLIC_IP_HERE'  # Change this to your live server IP
+
 
 def get_file_hash(filepath):
     if not os.path.exists(filepath):
@@ -16,6 +18,7 @@ def get_file_hash(filepath):
         for chunk in iter(lambda: f.read(BUFFER_SIZE), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
 
 def get_local_manifest():
     if not os.path.exists(CLIENT_DATA_DIR):
@@ -32,6 +35,7 @@ def get_local_manifest():
             }
     return manifest
 
+
 def upload_file(secure_client, filename, file_size, token, protocol="TCP"):
     print(f"Uploading '{filename}' via {protocol}...")
     filepath = os.path.join(CLIENT_DATA_DIR, filename)
@@ -43,40 +47,50 @@ def upload_file(secure_client, filename, file_size, token, protocol="TCP"):
         "protocol": protocol
     })
     init_resp = recv_msg(secure_client)
-    
+
     if init_resp.get("status") != "ready":
         print(f"Server rejected upload for {filename}: {init_resp.get('msg')}")
         return False
 
     data_port = init_resp.get("data_port")
-    data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # Dynamically choose socket type based on the requested protocol
+    sock_type = socket.SOCK_STREAM if protocol == "TCP" else socket.SOCK_DGRAM
+    data_sock = socket.socket(socket.AF_INET, sock_type)
+
     try:
-        data_sock.connect((SERVER_IP, data_port))
-        
+        # Branch the connection logic
         if protocol == "TCP":
+            data_sock.connect((SERVER_IP, data_port))
             data_conn = TCPDataConnection(data_sock)
+            data_conn.send_data(token.encode('utf-8'))
+        elif protocol == "RUDP":
+            data_conn = RUDPDataConnection(data_sock)
+            # The custom connect method handles setting the destination and sending the token
+            data_conn.connect(token, (SERVER_IP, data_port))
         else:
-            print("RUDP not implemented on client.")
+            print(f"Unknown protocol requested: {protocol}")
+            data_sock.close()
             return False
 
-        data_conn.send_data(token.encode('utf-8'))
-        
         with open(filepath, "rb") as f:
             while True:
                 chunk = f.read(BUFFER_SIZE)
                 if not chunk:
                     break
                 data_conn.send_data(chunk)
+
     except Exception as e:
         print(f"Failed to upload {filename}: {e}")
         return False
     finally:
-        data_conn.close()
+        if 'data_conn' in locals() and hasattr(data_conn, 'close'):
+            data_conn.close()
 
-    time.sleep(0.5) 
+    time.sleep(0.5)
     send_msg(secure_client, {"cmd": "VERIFY_HASH", "filename": filename})
     verify_resp = recv_msg(secure_client)
-    
+
     if verify_resp.get("status") == "success":
         server_hash = verify_resp.get("hash")
         local_hash = get_file_hash(filepath)
@@ -88,6 +102,7 @@ def upload_file(secure_client, filename, file_size, token, protocol="TCP"):
             return False
     return False
 
+
 def download_file(secure_client, filename, expected_hash, token, protocol="TCP"):
     print(f"Downloading '{filename}' via {protocol}...")
     filepath = os.path.join(CLIENT_DATA_DIR, filename)
@@ -98,7 +113,7 @@ def download_file(secure_client, filename, expected_hash, token, protocol="TCP")
         "protocol": protocol
     })
     init_resp = recv_msg(secure_client)
-    
+
     if init_resp.get("status") != "ready":
         print(f"Server rejected download for {filename}: {init_resp.get('msg')}")
         return False
@@ -106,18 +121,25 @@ def download_file(secure_client, filename, expected_hash, token, protocol="TCP")
     data_port = init_resp.get("data_port")
     expected_size = init_resp.get("file_size")
 
-    data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Dynamically choose socket type based on the requested protocol
+    sock_type = socket.SOCK_STREAM if protocol == "TCP" else socket.SOCK_DGRAM
+    data_sock = socket.socket(socket.AF_INET, sock_type)
+
     try:
-        data_sock.connect((SERVER_IP, data_port))
-        
+        # Branch the connection logic
         if protocol == "TCP":
+            data_sock.connect((SERVER_IP, data_port))
             data_conn = TCPDataConnection(data_sock)
+            data_conn.send_data(token.encode('utf-8'))
+        elif protocol == "RUDP":
+            data_conn = RUDPDataConnection(data_sock)
+            # Send the token to initiate the RUDP server binding
+            data_conn.connect(token, (SERVER_IP, data_port))
         else:
-            print("RUDP not implemented on client.")
+            print(f"Unknown protocol requested: {protocol}")
+            data_sock.close()
             return False
 
-        data_conn.send_data(token.encode('utf-8'))
-        
         with open(filepath, "wb") as f:
             received = 0
             while received < expected_size:
@@ -126,11 +148,13 @@ def download_file(secure_client, filename, expected_hash, token, protocol="TCP")
                     break
                 f.write(chunk)
                 received += len(chunk)
+
     except Exception as e:
         print(f"Failed to download {filename}: {e}")
         return False
     finally:
-        data_conn.close()
+        if 'data_conn' in locals() and hasattr(data_conn, 'close'):
+            data_conn.close()
 
     local_hash = get_file_hash(filepath)
     if local_hash == expected_hash:
@@ -140,6 +164,7 @@ def download_file(secure_client, filename, expected_hash, token, protocol="TCP")
         print(f"ERROR: Hash mismatch for '{filename}'.")
         return False
 
+
 def main():
     context = ssl.create_default_context()
     context.check_hostname = False
@@ -147,7 +172,7 @@ def main():
 
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     secure_client = context.wrap_socket(client, server_hostname=SERVER_IP)
-    
+
     try:
         secure_client.connect((SERVER_IP, CONTROL_PORT))
     except Exception as e:
@@ -156,12 +181,12 @@ def main():
 
     send_msg(secure_client, {"cmd": "AUTH", "username": "admin", "password": "password123"})
     auth_resp = recv_msg(secure_client)
-    
+
     if auth_resp.get("status") != "success":
         print(f"Authentication failed: {auth_resp.get('msg')}")
         secure_client.close()
         return
-    
+
     token = auth_resp.get("token")
     print("Authentication successful.")
 
@@ -189,14 +214,17 @@ def main():
     else:
         print(f"Sync Plan: {len(files_to_upload)} files to upload, {len(files_to_download)} files to download.")
 
+    # I changed the default protocol here to "RUDP" so it actually tests our new code!
+    # You can easily swap this back to "TCP" if you want to compare their performance.
     for filename, file_size in files_to_upload:
-        upload_file(secure_client, filename, file_size, token, protocol="TCP")
+        upload_file(secure_client, filename, file_size, token, protocol="RUDP")
 
     for filename, expected_hash in files_to_download:
-        download_file(secure_client, filename, expected_hash, token, protocol="TCP")
+        download_file(secure_client, filename, expected_hash, token, protocol="RUDP")
 
     secure_client.close()
     print("Session closed.")
+
 
 if __name__ == "__main__":
     main()
