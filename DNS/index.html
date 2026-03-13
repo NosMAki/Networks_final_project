@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ariel University Captive Portal</title>
+    <style>
+        body { font-family: 'Alef', 'Arial', sans-serif; background-color: #f7f9fc; margin: 0; color: #333; }
+        .header { background-color: #0c1b3d; color: #fff; padding: 20px 40px; border-bottom: 2px solid #fff; }
+        .header h1 { margin: 0; font-size: 2.5rem; }
+        .main-content { padding: 40px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+        .welcome-msg { background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 80%; max-width: 600px; margin-bottom: 30px; }
+        .welcome-msg p { font-size: 1.2rem; line-height: 1.6; margin: 10px 0; }
+        .info-panel { background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 80%; max-width: 600px; }
+        .login-title { color: #0c1b3d; font-size: 1.8rem; margin-top: 0; }
+        form { display: flex; flex-direction: column; width: 100%; }
+        label { font-size: 1.1rem; margin-bottom: 5px; text-align: right; display: block; }
+        input[type="text"], input[type="password"] { padding: 12px; margin-bottom: 20px; border: 1px solid #ccc; border-radius: 4px; font-size: 1rem; width: 100%; box-sizing: border-box; }
+        input[type="text"]:focus, input[type="password"]:focus { border-color: #0c1b3d; box-shadow: 0 0 5px rgba(12, 27, 61, 0.5); }
+        button { background-color: #0c1b3d; color: #fff; padding: 15px; border: none; border-radius: 4px; font-size: 1.2rem; cursor: pointer; margin-top: 10px; transition: background-color 0.3s; }
+        button:hover { background-color: #08122a; }
+        .footer-links { margin-top: 20px; text-align: center; }
+        .footer-links a { color: #0c1b3d; text-decoration: none; margin: 0 10px; font-weight: bold; }
+        .footer-links a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>חיבור רשת מהיר - סטודנטים בלבד</h1>
+    </div>
+    <div class="main-content">
+        <div class="welcome-msg">
+            <p><strong>שלום סטודנט יקר,</strong></p>
+            <p>אנא התחברו למערכת המידע האישי כדי לקבל גישה מלאה לאינטרנט בקמפוס.</p>
+        </div>
+        <div class="info-panel">
+            <h2 class="login-title">כניסה למערכת המידע האישי</h2>
+            <form action="/" method="post">
+                <label for="student_id">ת.ז./דרכון:</label>
+                <input type="text" id="student_id" name="student_id" required>
+                <label for="password">סיסמה:</label>
+                <input type="password" id="password" name="password" required>
+                <button type="submit" onclick="alert('POC Mode: credentials not stored'); return false;">כניסה</button>
+            </form>
+            <div class="footer-links">
+                <a href="#">שכחת סיסמה?</a> | <a href="#">רישום ראשוני</a>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
