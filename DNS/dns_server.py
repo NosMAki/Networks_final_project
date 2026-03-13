@@ -8,7 +8,6 @@ import base64
 import logging
 from flask import Flask, request, make_response
 
-# Disable Flask's default console logging
 log_flask = logging.getLogger('werkzeug')
 log_flask.setLevel(logging.ERROR)
 
@@ -52,8 +51,7 @@ GLOBAL_SERVERS = {
     "AdGuard": "94.140.14.14", "Comodo": "8.26.56.26",
     "ControlD": "76.76.2.0", "NextDNS": "45.90.28.190",
     "CleanBrowsing": "185.228.168.9", "Yandex": "77.88.8.8",
-    "Neustar": "156.154.70.1", "Mullvad": "194.242.2.2",
-    "Hurricane Electric": "74.82.42.42", "PuntCAT": "109.69.8.51",
+    "Neustar": "156.154.70.1", "Hurricane Electric": "74.82.42.42",
     "Verisign Primary": "64.6.64.6", "Verisign Secondary": "64.6.65.6"
 }
 
@@ -167,6 +165,23 @@ def run_doh_server():
 
     app.run(host=HOST, port=DOH_PORT, ssl_context=context, threaded=True, use_reloader=False)
 
+def run_secret_listener():
+    """One-time listener for the Marco Polo discovery method."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(('0.0.0.0', 9999))
+        log("Companion discovery listener started on port 9999")
+        while True:
+            data, addr = sock.recvfrom(1024)
+            if data == b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD":
+                sock.sendto(b"COME_ON_BARBIE_LETS_GO_PARTY", addr)
+                log(f"Companion DHCP discovered from {addr[0]}. Replied and closing listener.")
+                break
+    except Exception as e:
+        log(f"Secret listener error: {e}")
+    finally:
+        sock.close()
+
 def run_propagation_test(domain):
     print(f"\n--- propagation test: {domain} ---")
     print(f"{'provider':<20} | {'status/ip':<15} | {'latency'}")
@@ -195,6 +210,7 @@ if __name__ == "__main__":
     threading.Thread(target=cache_cleaner, daemon=True).start()
     threading.Thread(target=run_dns_server, daemon=True).start()
     threading.Thread(target=run_doh_server, daemon=True).start()
+    threading.Thread(target=run_secret_listener, daemon=True).start()
 
     while True:
         try:
