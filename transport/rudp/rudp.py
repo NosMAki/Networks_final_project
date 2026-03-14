@@ -3,6 +3,10 @@ import struct  # Used to pack and unpack packet headers
 import select  # Used for timeout handling and non-blocking reads
 import math
 import time
+import logging
+
+# Initialize the logger for this module
+logger = logging.getLogger(__name__)
 
 
 class RUDPSocket:
@@ -63,13 +67,20 @@ class RUDPSocket:
         base = 0
         next_seq = 0
 
+        MAX_SEND_RETRIES = 50
+        timeout_retries = 0
+
         # Main sending loop
         while base < total_chunks:
             # -------- Send window --------
             while next_seq < base + int(self.cwnd) and next_seq < total_chunks:
                 global_seq = self.seq_num + next_seq
                 header = self._pack_header(global_seq, 0, self.FLAG_DATA)
-                self.sock.sendto(header + chunks[next_seq], self.dest_addr)
+
+                try:
+                    self.sock.sendto(header + chunks[next_seq], self.dest_addr)
+                except (BlockingIOError, ConnectionResetError):
+                    pass  # Ignore block/reset and let timeout handle retransmission
 
                 # Record send time to calculate RTT later
                 if global_seq not in self.send_times:
@@ -81,6 +92,8 @@ class RUDPSocket:
             ready = select.select([self.sock], [], [], self.rto)
 
             if ready[0]:
+                timeout_retries = 0  # Reset failsafe counter
+
                 # Receive all available packets from the OS buffer
                 while True:
                     try:
@@ -104,8 +117,9 @@ class RUDPSocket:
                                     self.dev_rtt = 0.75 * self.dev_rtt + 0.25 * abs(sample_rtt - self.estimated_rtt)
                                     self.rto = self.estimated_rtt + 4 * self.dev_rtt
 
-                                    print(
-                                        f"[RTT Log] Sample: {sample_rtt * 1000:.1f}ms | Estimated: {self.estimated_rtt * 1000:.1f}ms | New RTO: {self.rto * 1000:.1f}ms")
+                                    logger.info(
+                                        f"[RTT Log] Sample: {sample_rtt * 1000:.1f}ms | Estimated: {self.estimated_rtt * 1000:.1f}ms | New RTO: {self.rto * 1000:.1f}ms"
+                                    )
 
                                 acked_amount = ack_idx - base
                                 base = ack_idx
@@ -116,33 +130,43 @@ class RUDPSocket:
                                 # Increase window size
                                 if self.cwnd < self.ssthresh:
                                     self.cwnd += acked_amount
-                                    print(f"[Slow Start] cwnd jumped from {old_cwnd:.2f} -> {self.cwnd:.2f}")
+                                    logger.info(f"[Slow Start] cwnd jumped from {old_cwnd:.2f} -> {self.cwnd:.2f}")
                                 else:
                                     self.cwnd += acked_amount / self.cwnd
-                                    print(
-                                        f"[Full Speed - Congestion Avoidance] cwnd grew from {old_cwnd:.2f} -> {self.cwnd:.2f}")
+                                    logger.info(
+                                        f"[Full Speed - Congestion Avoidance] cwnd grew from {old_cwnd:.2f} -> {self.cwnd:.2f}"
+                                    )
 
                             # -------- Fast Retransmit --------
                             elif ack_idx == base:
                                 self.dup_ack_count += 1
                                 if self.dup_ack_count == 3:
-                                    print(
-                                        f"[Fast Retransmit] 3 Dup ACKs for packet {self.seq_num + base}. Retransmitting immediately!")
+                                    logger.warning(
+                                        f"[Fast Retransmit] 3 Dup ACKs for packet {self.seq_num + base}. Retransmitting immediately!"
+                                    )
 
                                     # Resend missing packet
                                     header = self._pack_header(self.seq_num + base, 0, self.FLAG_DATA)
-                                    self.sock.sendto(header + chunks[base], self.dest_addr)
+                                    try:
+                                        self.sock.sendto(header + chunks[base], self.dest_addr)
+                                    except (BlockingIOError, ConnectionResetError):
+                                        pass
+
                                     self.retransmitted.add(self.seq_num + base)
 
                                     # Cut threshold in half
                                     self.ssthresh = max(self.cwnd / 2.0, 2.0)
                                     self.cwnd = self.ssthresh + 3.0
 
-                    except BlockingIOError:
-                        break
+                    except (BlockingIOError, ConnectionResetError):
+                        break  # Buffer is empty or connection reset
             else:
                 # -------- Timeout handling --------
-                print(f"[TIMEOUT] RTO of {self.rto * 1000:.1f}ms expired! Resetting window.")
+                timeout_retries += 1
+                if timeout_retries >= MAX_SEND_RETRIES:
+                    raise TimeoutError("RUDP sendall timed out waiting for ACKs.")
+
+                logger.warning(f"[TIMEOUT] RTO of {self.rto * 1000:.1f}ms expired! Resetting window.")
 
                 # Drop window to 1
                 self.ssthresh = max(self.cwnd / 2.0, 2.0)
@@ -152,7 +176,10 @@ class RUDPSocket:
 
                 # Send the missing packet
                 header = self._pack_header(self.seq_num + base, 0, self.FLAG_DATA)
-                self.sock.sendto(header + chunks[base], self.dest_addr)
+                try:
+                    self.sock.sendto(header + chunks[base], self.dest_addr)
+                except (BlockingIOError, ConnectionResetError):
+                    pass
 
         # Reset state for next transfer
         self.seq_num += total_chunks
@@ -160,15 +187,25 @@ class RUDPSocket:
         self.retransmitted.clear()
 
     def recvall(self, size: int) -> bytes:
+        timeout_retries = 0
+        MAX_RETRIES = 150  # 150 * 0.1s = 15 seconds max timeout
+
         while len(self.recv_buffer) < size:
             ready = select.select([self.sock], [], [], 0.1)
 
             if ready[0]:
+                timeout_retries = 0  # Reset on activity
+
                 # Receive all available packets
                 while True:
                     try:
                         data, addr = self.sock.recvfrom(65535)
-                        self.dest_addr = addr
+
+                        # Prevent Connection Hijacking
+                        if self.dest_addr is None:
+                            self.dest_addr = addr
+                        elif addr != self.dest_addr:
+                            continue
 
                         seq, ack, flags = self._unpack_header(data)
                         payload = data[self.HEADER_SIZE:]
@@ -202,10 +239,14 @@ class RUDPSocket:
                                 ack_header = self._pack_header(0, self.expected_seq, self.FLAG_ACK)
                                 self.sock.sendto(ack_header, self.dest_addr)
 
-                    except BlockingIOError:
+                    except (BlockingIOError, ConnectionResetError):
                         break
+            else:
+                timeout_retries += 1
+                if timeout_retries >= MAX_RETRIES:
+                    raise TimeoutError("RUDP recvall timed out waiting for packets.")
 
-                        # Return the requested amount of data
+        # Return the requested amount of data
         data_to_return = bytes(self.recv_buffer[:size])
         del self.recv_buffer[:size]
         return data_to_return
