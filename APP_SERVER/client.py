@@ -9,7 +9,7 @@ import getpass
 from tqdm import tqdm
 from shared import send_msg, recv_msg, TCPDataConnection, RUDPDataConnection, CONTROL_PORT, BUFFER_SIZE
 
-SERVER_IP = '10.0.0.79' # Change to your live server's IP when deploying
+SERVER_IP = 'backup.com' # Change to your live server's IP when deploying
 
 class SyncClient:
     def __init__(self):
