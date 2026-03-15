@@ -6,7 +6,6 @@ import hashlib
 import uuid
 import json
 import logging
-import signal
 import sys
 from shared import send_msg, recv_msg, TCPDataConnection, RUDPDataConnection, CONTROL_PORT, DATA_PORT_RANGE, BUFFER_SIZE
 
@@ -14,7 +13,7 @@ SERVER_DATA_DIR = "./server_data"
 DB_FILE = "users.json"
 DEFAULT_QUOTA = 1024 * 1024 * 1024  # 1 GB default quota
 
-# Setup Logging (File only, keeps the console clean for the Management CLI)
+# Setup Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -52,22 +51,19 @@ def get_directory_size(path):
 class BackupServer:
     def __init__(self):
         self.active_sessions = {}
-        self.session_lock = threading.Lock() # Thread-safety for the Management CLI
+        self.session_lock = threading.Lock()
         self.users = load_users()
-        self.pending_quota_requests = {} # Tracks requests from clients
+        self.pending_quota_requests = {}
         self.running = True
         
         if not os.path.exists(SERVER_DATA_DIR):
             os.makedirs(SERVER_DATA_DIR)
 
-        # Graceful Shutdown hook
-        signal.signal(signal.SIGINT, self.shutdown_handler)
-
-    def shutdown_handler(self, signum, frame):
-        print("\n[SHUTDOWN] Ctrl+C detected. Initiating graceful shutdown...")
-        logging.info("Server shutting down via Ctrl+C")
+    def shutdown(self):
+        print("\n[SHUTDOWN] Initiating forced server shutdown...")
+        logging.info("Server manually stopped via CLI.")
         self.running = False
-        sys.exit(0)
+        os._exit(0)
 
     def get_file_hash(self, filepath):
         if not os.path.exists(filepath):
@@ -84,18 +80,39 @@ class BackupServer:
         if not os.path.exists(user_dir):
             return manifest
             
-        for filename in os.listdir(user_dir):
-            filepath = os.path.join(user_dir, filename)
-            if os.path.isfile(filepath):
-                stat = os.stat(filepath)
-                manifest[filename] = {
-                    "size": stat.st_size,
-                    "mtime": stat.st_mtime,
-                    "hash": self.get_file_hash(filepath)
-                }
+        # FIX 1: Recursively walk directory for Subdirectory Support
+        for dirpath, _, filenames in os.walk(user_dir):
+            for f in filenames:
+                filepath = os.path.join(dirpath, f)
+                if os.path.isfile(filepath):
+                    stat = os.stat(filepath)
+                    
+                    # Force relative paths to lowercase and standard network slashes
+                    rel_path = os.path.relpath(filepath, user_dir).lower().replace('\\', '/')
+                    manifest[rel_path] = {
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "hash": self.get_file_hash(filepath)
+                    }
         return manifest
 
-    def handle_data_transfer(self, token, filename, file_size, protocol, action):
+    def get_secure_filepath(self, username, raw_filename):
+        """Sanitizes filename, checks for path traversal, and returns absolute path."""
+        # Lowercase and standardize
+        clean_name = raw_filename.lower().replace('\\', '/')
+        if ".." in clean_name or clean_name.startswith("/"):
+            return None
+            
+        base_dir = os.path.abspath(os.path.join(SERVER_DATA_DIR, username))
+        target_path = os.path.abspath(os.path.join(base_dir, clean_name))
+        
+        # Verify target is actually inside the user's directory boundary
+        if not target_path.startswith(base_dir):
+            return None
+            
+        return target_path
+
+    def handle_data_transfer(self, token, filepath, file_size, protocol, action):
         sock_type = socket.SOCK_STREAM if protocol == "TCP" else socket.SOCK_DGRAM
         data_sock = socket.socket(socket.AF_INET, sock_type)
         data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -143,11 +160,13 @@ class BackupServer:
                     if token not in self.active_sessions:
                         return
                     username = self.active_sessions[token]
-                    
-                filepath = os.path.join(SERVER_DATA_DIR, username, filename)
 
                 if action == "UPLOAD":
-                    logging.info(f"[{username}] Receiving {filename} via {protocol}...")
+                    logging.info(f"[{username}] Receiving {os.path.basename(filepath)} via {protocol}...")
+                    
+                    # Ensure intermediate directories exist
+                    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                    
                     with open(filepath, "wb") as f:
                         received = 0
                         while received < file_size:
@@ -156,17 +175,17 @@ class BackupServer:
                                 break
                             f.write(chunk)
                             received += len(chunk)
-                    logging.info(f"[{username}] Finished receiving {filename}")
+                    logging.info(f"[{username}] Finished receiving {os.path.basename(filepath)}")
 
                 elif action == "DOWNLOAD":
-                    logging.info(f"[{username}] Sending {filename} via {protocol}...")
+                    logging.info(f"[{username}] Sending {os.path.basename(filepath)} via {protocol}...")
                     with open(filepath, "rb") as f:
                         while True:
                             chunk = f.read(BUFFER_SIZE)
                             if not chunk:
                                 break
                             data_conn.send_data(chunk)
-                    logging.info(f"[{username}] Finished sending {filename}")
+                    logging.info(f"[{username}] Finished sending {os.path.basename(filepath)}")
 
                 if hasattr(data_conn, 'close'):
                     data_conn.close()
@@ -197,11 +216,8 @@ class BackupServer:
                     username = msg.get("username")
                     password = msg.get("password")
                     
-                    # Read from persistent JSON
                     if username in self.users and self.users[username]["password"] == password:
                         current_token = str(uuid.uuid4())
-                        
-                        # Thread-safe dictionary update
                         with self.session_lock:
                             self.active_sessions[current_token] = username
 
@@ -225,15 +241,20 @@ class BackupServer:
                     manifest = self.generate_manifest(username)
                     send_msg(conn, {"status": "success", "manifest": manifest})
 
+                elif cmd == "CHECK_USAGE":
+                    with self.session_lock:
+                        username = self.active_sessions[current_token]
+                    user_dir = os.path.join(SERVER_DATA_DIR, username)
+                    used_bytes = get_directory_size(user_dir)
+                    quota_bytes = self.users[username].get("quota", DEFAULT_QUOTA)
+                    send_msg(conn, {"status": "success", "used": used_bytes, "quota": quota_bytes})
+
                 elif cmd == "QUOTA_REQUEST":
                     with self.session_lock:
                         username = self.active_sessions[current_token]
                     amount = msg.get("amount_mb", "unknown")
-                    
-                    # Store the request
                     with self.session_lock:
                         self.pending_quota_requests[username] = amount
-                        
                     logging.info(f"[QUOTA REQUEST] User '{username}' is requesting {amount} MB of additional storage.")
                     send_msg(conn, {"status": "success", "msg": f"Your request for {amount} MB has been logged for admin review."})
 
@@ -241,9 +262,14 @@ class BackupServer:
                     with self.session_lock:
                         username = self.active_sessions[current_token]
                         
-                    filename = os.path.basename(msg.get("filename", ""))
+                    raw_filename = msg.get("filename", "")
                     file_size = msg.get("file_size", 0)
                     protocol = msg.get("protocol", "TCP")
+
+                    filepath = self.get_secure_filepath(username, raw_filename)
+                    if not filepath:
+                        send_msg(conn, {"status": "error", "msg": "Invalid file path."})
+                        continue
 
                     # Enforce Quota limits
                     user_dir = os.path.join(SERVER_DATA_DIR, username)
@@ -255,7 +281,7 @@ class BackupServer:
                         send_msg(conn, {"status": "error", "msg": "Quota exceeded. Contact admin for more storage."})
                         continue
 
-                    data_port = self.handle_data_transfer(current_token, filename, file_size, protocol, action="UPLOAD")
+                    data_port = self.handle_data_transfer(current_token, filepath, file_size, protocol, action="UPLOAD")
                     if data_port:
                         send_msg(conn, {"status": "ready", "data_port": data_port})
                     else:
@@ -265,16 +291,16 @@ class BackupServer:
                     with self.session_lock:
                         username = self.active_sessions[current_token]
                         
-                    filename = os.path.basename(msg.get("filename", ""))
+                    raw_filename = msg.get("filename", "")
                     protocol = msg.get("protocol", "TCP")
-                    filepath = os.path.join(SERVER_DATA_DIR, username, filename)
-
-                    if not os.path.exists(filepath):
+                    
+                    filepath = self.get_secure_filepath(username, raw_filename)
+                    if not filepath or not os.path.exists(filepath):
                         send_msg(conn, {"status": "error", "msg": "File not found"})
                         continue
 
                     file_size = os.path.getsize(filepath)
-                    data_port = self.handle_data_transfer(current_token, filename, file_size, protocol, action="DOWNLOAD")
+                    data_port = self.handle_data_transfer(current_token, filepath, file_size, protocol, action="DOWNLOAD")
 
                     if data_port:
                         send_msg(conn, {"status": "ready", "data_port": data_port, "file_size": file_size})
@@ -285,12 +311,34 @@ class BackupServer:
                     with self.session_lock:
                         username = self.active_sessions[current_token]
                         
-                    filename = os.path.basename(msg.get("filename", ""))
-                    filepath = os.path.join(SERVER_DATA_DIR, username, filename)
+                    raw_filename = msg.get("filename", "")
+                    filepath = self.get_secure_filepath(username, raw_filename)
 
-                    file_hash = self.get_file_hash(filepath)
+                    file_hash = self.get_file_hash(filepath) if filepath else None
                     if file_hash:
                         send_msg(conn, {"status": "success", "hash": file_hash})
+                    else:
+                        send_msg(conn, {"status": "error", "msg": "File not found"})
+
+                # FIX 2: Implementation for Deletions
+                elif cmd == "DELETE":
+                    with self.session_lock:
+                        username = self.active_sessions[current_token]
+                        
+                    raw_filename = msg.get("filename", "")
+                    filepath = self.get_secure_filepath(username, raw_filename)
+                    
+                    if not filepath:
+                        send_msg(conn, {"status": "error", "msg": "Invalid file path."})
+                        continue
+
+                    if os.path.exists(filepath):
+                        try:
+                            os.remove(filepath)
+                            logging.info(f"[{username}] Deleted {raw_filename}")
+                            send_msg(conn, {"status": "success", "msg": f"Deleted {raw_filename}"})
+                        except Exception as e:
+                            send_msg(conn, {"status": "error", "msg": str(e)})
                     else:
                         send_msg(conn, {"status": "error", "msg": "File not found"})
 
@@ -313,12 +361,9 @@ class BackupServer:
         context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
         secure_server = context.wrap_socket(server, server_side=True)
 
-        print(f"[*] Server listening on port {CONTROL_PORT} with TLS")
-        print("[*] Logs are being written to server.log")
-        print("[*] Management CLI Ready. Type 'status', 'users', 'requests', or 'setquota <user> <mb>'")
+        self.print_startup_instructions()
         logging.info(f"Server started on port {CONTROL_PORT}")
         
-        # Start the Management CLI in a separate thread
         threading.Thread(target=self.management_cli, daemon=True).start()
 
         try:
@@ -327,7 +372,7 @@ class BackupServer:
                 try:
                     conn, addr = secure_server.accept()
                     conn.settimeout(None) 
-                    thread = threading.Thread(target=self.handle_client, args=(conn, addr))
+                    thread = threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True)
                     thread.start()
                 except socket.timeout:
                     continue
@@ -338,8 +383,12 @@ class BackupServer:
         finally:
             secure_server.close()
 
+    def print_startup_instructions(self):
+        print(f"[*] Server listening on port {CONTROL_PORT} with TLS")
+        print("[*] Logs are being written to server.log")
+        print("[*] Management CLI Ready. Type 'status', 'users', 'requests', 'setquota <user> <mb>', 'clear', or 'exit'")
+
     def management_cli(self):
-        """A simple threaded CLI for server management."""
         while self.running:
             try:
                 cmd = input("CLI> ").strip().lower()
@@ -381,11 +430,9 @@ class BackupServer:
                             new_quota_mb = int(parts[2])
                             if user in self.users:
                                 self.users[user]["quota"] = new_quota_mb * 1024 * 1024
-                                # Save back to JSON
                                 with open(DB_FILE, 'w') as f:
                                     json.dump(self.users, f, indent=4)
                                 
-                                # Clear the request once approved
                                 with self.session_lock:
                                     if user in self.pending_quota_requests:
                                         del self.pending_quota_requests[user]
@@ -398,8 +445,16 @@ class BackupServer:
                             print("[-] Usage: setquota <username> <megabytes>")
                     else:
                         print("[-] Usage: setquota <username> <megabytes>")
+                        
+                elif cmd == "clear":
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    self.print_startup_instructions()
+                    
+                elif cmd in ["exit", "quit", "stop"]:
+                    self.shutdown()
+                    
                 else:
-                    print("[-] Unknown command. Available: status, users, requests, setquota")
+                    print("[-] Unknown command. Available: status, users, requests, setquota, clear, exit")
             except EOFError:
                 break
 
