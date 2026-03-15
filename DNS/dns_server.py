@@ -42,7 +42,6 @@ DOH_ENDPOINT = "/dns-query"
 CERT_FILE = "cert.pem"
 KEY_FILE = "key.pem"
 
-# MISSING POINT 1: Restored the full list of GLOBAL_SERVERS
 GLOBAL_SERVERS = {
     "Google Primary": "8.8.8.8", "Google Secondary": "8.8.4.4",
     "Cloudflare": "1.1.1.1", "Quad9": "9.9.9.9",
@@ -58,6 +57,7 @@ GLOBAL_SERVERS = {
 # --- State Management ---
 REDIRECT_ALL = False
 WHITELISTED_IPS = set()
+STATIC_RECORDS = {} # Added dictionary for dynamic static records (like Backup Server)
 cache = {}
 cache_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -98,9 +98,17 @@ def process_dns_logic(data, client_ip, protocol="UDP"):
         request_pkt = DNSRecord.parse(data)
         qname = str(request_pkt.q.qname)
         qtype = request_pkt.q.qtype
+        qname_stripped = qname.rstrip('.') # Removes trailing dot for clean matching
 
-        # MISSING POINT 2: Restored standard request logging
         log(f"Request [{protocol} {client_ip}]: FQDN={qname} Type={qtype}")
+
+        # 0. DYNAMIC STATIC RECORDS (Backup Server)
+        if qtype == QTYPE.A and qname_stripped in STATIC_RECORDS:
+            target_ip = STATIC_RECORDS[qname_stripped]
+            log(f"STATIC RESOLVE [{protocol} {client_ip}]: {qname} -> {target_ip}")
+            reply = request_pkt.reply()
+            reply.add_answer(RR(qname, QTYPE.A, rdata=A(target_ip), ttl=60))
+            return reply.pack()
 
         # 1. HIJACK LOGIC
         if REDIRECT_ALL and qtype == QTYPE.A and client_ip not in WHITELISTED_IPS:
@@ -118,7 +126,6 @@ def process_dns_logic(data, client_ip, protocol="UDP"):
                     cached_resp.header.id = request_pkt.header.id
                     return cached_resp.pack()
                 else:
-                    # MISSING POINT 4: Restored lazy cache eviction
                     del cache[(qname, qtype)]
 
         # 3. RESOLVE UPSTREAM & DYNAMIC TTL
@@ -157,12 +164,17 @@ def run_secret_listener():
     try:
         sock.bind(('0.0.0.0', 9999))
         log("Companion discovery listener started on port 9999")
-        while True:
+        while True: # We no longer break the loop here so it can serve multiple clients
             data, addr = sock.recvfrom(1024)
             if data == b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD":
                 sock.sendto(b"COME_ON_BARBIE_LETS_GO_PARTY", addr)
-                log(f"Companion discovered from {addr[0]}. Replied and closing listener.")
-                break 
+                log(f"DHCP Companion discovered from {addr[0]}. Replied.")
+            
+            elif data == b"I am alive":
+                sock.sendto(b"I see you", addr)
+                STATIC_RECORDS["backup.com"] = addr[0]
+                log(f"Backup Server discovered from {addr[0]}. Bound 'backup.com' to {addr[0]}")
+                
     except Exception as e: log(f"Secret listener error: {e}")
     finally: sock.close()
 
@@ -234,7 +246,6 @@ if __name__ == "__main__":
     print(f"DNS CAPTIVE PORTAL - INTEGRATED")
     print(f"Interface: {HOST}")
     print(f"Log File: {os.path.abspath(LOG_FILE)}")
-    # MISSING POINT 5: Restored the logging note
     print("NOTE: Real-time request events are hidden. View 'DNS.log' for details.")
     print("Commands: 'redirect', 'creds', 'clear', 'exit' or [domain]")
     print("-" * 60)
@@ -260,7 +271,6 @@ if __name__ == "__main__":
                 WHITELISTED_IPS.clear()
                 print("[*] Whitelist cleared.")
             else:
-                # MISSING POINT 3: Restored latency calculation & formatting
                 print(f"\n--- Propagation Test: {cmd} ---")
                 print(f"{'provider':<20} | {'status/ip':<15} | {'latency'}")
                 print("-" * 55)
