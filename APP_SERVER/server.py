@@ -59,6 +59,31 @@ class BackupServer:
         if not os.path.exists(SERVER_DATA_DIR):
             os.makedirs(SERVER_DATA_DIR)
 
+    def announce_presence(self):
+        """Broadcasts server presence to the DNS server to register backup.com"""
+        print("\n[*] Broadcasting presence to DNS server for record creation...")
+        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        discovery_socket.settimeout(2.0)
+
+        secret_msg = b"I am alive"
+        expected_reply = b"I see you"
+
+        for attempt in range(1, 4):
+            print(f"    [~] Attempt {attempt}/3 to announce presence to DNS on port 9999...")
+            try:
+                discovery_socket.sendto(secret_msg, ('255.255.255.255', 9999))
+                data, addr = discovery_socket.recvfrom(1024)
+                if data == expected_reply:
+                    print(f"    [+] DNS Server acknowledged us from {addr[0]}! 'backup.com' is now linked.\n")
+                    break
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"    [-] Socket error during announcement: {e}")
+                
+        discovery_socket.close()
+
     def shutdown(self):
         print("\n[SHUTDOWN] Initiating forced server shutdown...")
         logging.info("Server manually stopped via CLI.")
@@ -352,6 +377,9 @@ class BackupServer:
             logging.info(f"[DISCONNECTED] {addr} disconnected.")
 
     def start(self):
+        # Trigger the pulse to the DNS Server before fully booting up the listeners
+        self.announce_presence()
+
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(('0.0.0.0', CONTROL_PORT))
