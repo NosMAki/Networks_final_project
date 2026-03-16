@@ -13,7 +13,7 @@ SERVER_DATA_DIR = "./server_data"
 DB_FILE = "users.json"
 DEFAULT_QUOTA = 1024 * 1024 * 1024  # 1 GB default quota
 
-# Setup Logging
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -58,7 +58,7 @@ class BackupServer:
         self.users = load_users()
         self.pending_quota_requests = {}
         self.running = True
-        
+
         if not os.path.exists(SERVER_DATA_DIR):
             os.makedirs(SERVER_DATA_DIR)
 
@@ -84,7 +84,7 @@ class BackupServer:
                 continue
             except Exception as e:
                 print(f"    [-] Socket error during announcement: {e}")
-                
+
         discovery_socket.close()
 
     def shutdown(self):
@@ -107,15 +107,15 @@ class BackupServer:
         manifest = {}
         if not os.path.exists(user_dir):
             return manifest
-            
-        # FIX 1: Recursively walk directory for Subdirectory Support
+
+        # FIX : Subdirectory Support
         for dirpath, _, filenames in os.walk(user_dir):
             for f in filenames:
                 filepath = os.path.join(dirpath, f)
                 if os.path.isfile(filepath):
                     stat = os.stat(filepath)
-                    
-                    # Force relative paths to lowercase and standard network slashes
+
+                    #force relative paths to lowercase and standard network slashes
                     rel_path = os.path.relpath(filepath, user_dir).lower().replace('\\', '/')
                     manifest[rel_path] = {
                         "size": stat.st_size,
@@ -126,18 +126,18 @@ class BackupServer:
 
     def get_secure_filepath(self, username, raw_filename):
         """Sanitizes filename, checks for path traversal, and returns absolute path."""
-        # Lowercase and standardize
+        # Lowercase
         clean_name = raw_filename.lower().replace('\\', '/')
         if ".." in clean_name or clean_name.startswith("/"):
             return None
-            
+
         base_dir = os.path.abspath(os.path.join(SERVER_DATA_DIR, username))
         target_path = os.path.abspath(os.path.join(base_dir, clean_name))
-        
-        # Verify target is actually inside the user's directory boundary
+
+        # Verify target is actually inside the user's directory boundary (prevent path manipulation!!!)
         if not target_path.startswith(base_dir):
             return None
-            
+
         return target_path
 
     def handle_data_transfer(self, token, filepath, file_size, protocol, action):
@@ -191,10 +191,10 @@ class BackupServer:
 
                 if action == "UPLOAD":
                     logging.info(f"[{username}] Receiving {os.path.basename(filepath)} via {protocol}...")
-                    
-                    # Ensure intermediate directories exist
+
+                    # Ensure intermediates
                     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                    
+
                     with open(filepath, "wb") as f:
                         received = 0
                         while received < file_size:
@@ -243,7 +243,7 @@ class BackupServer:
                 if cmd == "AUTH":
                     username = msg.get("username")
                     password = msg.get("password")
-                    
+
                     if username in self.users and self.users[username]["password"] == password:
                         current_token = str(uuid.uuid4())
                         with self.session_lock:
@@ -289,7 +289,7 @@ class BackupServer:
                 elif cmd == "UPLOAD_INIT":
                     with self.session_lock:
                         username = self.active_sessions[current_token]
-                        
+
                     raw_filename = msg.get("filename", "")
                     file_size = msg.get("file_size", 0)
                     protocol = msg.get("protocol", "TCP")
@@ -299,7 +299,7 @@ class BackupServer:
                         send_msg(conn, {"status": "error", "msg": "Invalid file path."})
                         continue
 
-                    # Enforce Quota limits
+                    # Enforce Quota
                     user_dir = os.path.join(SERVER_DATA_DIR, username)
                     current_usage = get_directory_size(user_dir)
                     user_quota = self.users[username].get("quota", DEFAULT_QUOTA)
@@ -318,10 +318,10 @@ class BackupServer:
                 elif cmd == "DOWNLOAD_INIT":
                     with self.session_lock:
                         username = self.active_sessions[current_token]
-                        
+
                     raw_filename = msg.get("filename", "")
                     protocol = msg.get("protocol", "TCP")
-                    
+
                     filepath = self.get_secure_filepath(username, raw_filename)
                     if not filepath or not os.path.exists(filepath):
                         send_msg(conn, {"status": "error", "msg": "File not found"})
@@ -338,7 +338,7 @@ class BackupServer:
                 elif cmd == "VERIFY_HASH":
                     with self.session_lock:
                         username = self.active_sessions[current_token]
-                        
+
                     raw_filename = msg.get("filename", "")
                     filepath = self.get_secure_filepath(username, raw_filename)
 
@@ -348,14 +348,14 @@ class BackupServer:
                     else:
                         send_msg(conn, {"status": "error", "msg": "File not found"})
 
-                # FIX 2: Implementation for Deletions
+                # Implementation of Deletions
                 elif cmd == "DELETE":
                     with self.session_lock:
                         username = self.active_sessions[current_token]
-                        
+
                     raw_filename = msg.get("filename", "")
                     filepath = self.get_secure_filepath(username, raw_filename)
-                    
+
                     if not filepath:
                         send_msg(conn, {"status": "error", "msg": "Invalid file path."})
                         continue
@@ -380,7 +380,7 @@ class BackupServer:
             logging.info(f"[DISCONNECTED] {addr} disconnected.")
 
     def start(self):
-        # Trigger the pulse to the DNS Server before fully booting up the listeners
+        #trigger pulse to the DNS Server before fully booting up the listeners
         self.announce_presence()
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -394,15 +394,15 @@ class BackupServer:
 
         self.print_startup_instructions()
         logging.info(f"Server started on port {CONTROL_PORT}")
-        
+
         threading.Thread(target=self.management_cli, daemon=True).start()
 
         try:
             while self.running:
-                secure_server.settimeout(1.0) 
+                secure_server.settimeout(1.0)
                 try:
                     conn, addr = secure_server.accept()
-                    conn.settimeout(None) 
+                    conn.settimeout(None)
                     thread = threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True)
                     thread.start()
                 except socket.timeout:
@@ -425,14 +425,14 @@ class BackupServer:
                 cmd = input("CLI> ").strip().lower()
                 if not cmd:
                     continue
-                    
+
                 if cmd == "status":
                     with self.session_lock:
                         active = len(self.active_sessions)
                     print(f"\n--- SERVER STATUS ---")
                     print(f"Active Sessions: {active}")
                     print(f"Registered Users: {len(self.users)}\n")
-                    
+
                 elif cmd == "users":
                     print("\n--- REGISTERED USERS ---")
                     for user, data in self.users.items():
@@ -441,7 +441,7 @@ class BackupServer:
                         quota_mb = data['quota'] / (1024*1024)
                         print(f"User: {user:<10} | Usage: {used_mb:>7.2f} MB / {quota_mb:>7.2f} MB")
                     print()
-                
+
                 elif cmd == "requests":
                     with self.session_lock:
                         reqs = dict(self.pending_quota_requests)
@@ -452,7 +452,7 @@ class BackupServer:
                         for usr, amt in reqs.items():
                             print(f"User: {usr:<10} | Requested Extra: {amt} MB")
                         print("Use 'setquota <user> <mb>' to approve.\n")
-                        
+
                 elif cmd.startswith("setquota"):
                     parts = cmd.split()
                     if len(parts) == 3:
@@ -463,11 +463,11 @@ class BackupServer:
                                 self.users[user]["quota"] = new_quota_mb * 1024 * 1024
                                 with open(DB_FILE, 'w') as f:
                                     json.dump(self.users, f, indent=4)
-                                
+
                                 with self.session_lock:
                                     if user in self.pending_quota_requests:
                                         del self.pending_quota_requests[user]
-                                        
+
                                 print(f"[+] Updated quota for {user} to {new_quota_mb} MB.")
                                 logging.info(f"Admin updated quota for {user} to {new_quota_mb} MB.")
                             else:
@@ -476,14 +476,14 @@ class BackupServer:
                             print("[-] Usage: setquota <username> <megabytes>")
                     else:
                         print("[-] Usage: setquota <username> <megabytes>")
-                        
+
                 elif cmd == "clear":
                     os.system('cls' if os.name == 'nt' else 'clear')
                     self.print_startup_instructions()
-                    
+
                 elif cmd in ["exit", "quit", "stop"]:
                     self.shutdown()
-                    
+
                 else:
                     print("[-] Unknown command. Available: status, users, requests, setquota, clear, exit")
             except EOFError:

@@ -6,11 +6,11 @@ import hashlib
 import sys
 import signal
 import getpass
-import logging  # <-- Added logging import
+import logging
 from tqdm import tqdm
 from shared import send_msg, recv_msg, TCPDataConnection, RUDPDataConnection, CONTROL_PORT, BUFFER_SIZE
 
-# <-- Added this block to route all logs to a file instead of the terminal
+
 logging.basicConfig(
     filename='rudp_transfer.log',
     filemode='a',
@@ -18,7 +18,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-SERVER_IP = '10.0.0.114' # Change to your live server's IP when deploying
+SERVER_IP = 'backup.com' # Change to your live server's IP when deploying MR TESTER! (UNLESS DNS SERVER IS LIVE!!)
 
 class SyncClient:
     def __init__(self):
@@ -45,7 +45,7 @@ class SyncClient:
 
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.secure_client = context.wrap_socket(client, server_hostname=SERVER_IP)
-        
+
         try:
             print(f"[*] Connecting to server at {SERVER_IP}:{CONTROL_PORT}...")
             self.secure_client.connect((SERVER_IP, CONTROL_PORT))
@@ -62,7 +62,7 @@ class SyncClient:
 
             send_msg(self.secure_client, {"cmd": "AUTH", "username": user, "password": pwd})
             resp = recv_msg(self.secure_client)
-            
+
             if resp and resp.get("status") == "success":
                 self.token = resp.get("token")
                 self.username = user
@@ -83,21 +83,20 @@ class SyncClient:
         if not os.path.exists(self.sync_dir):
             os.makedirs(self.sync_dir)
         manifest = {}
-        
+
         for dirpath, _, filenames in os.walk(self.sync_dir):
             for f in filenames:
                 filepath = os.path.join(dirpath, f)
                 if os.path.isfile(filepath):
                     stat = os.stat(filepath)
-                    
-                    # Force relative paths to lowercase and standard network slashes
+
                     rel_path = os.path.relpath(filepath, self.sync_dir).lower().replace('\\', '/')
-                    
+
                     manifest[rel_path] = {
                         "size": stat.st_size,
                         "mtime": stat.st_mtime,
                         "hash": self.get_file_hash(filepath),
-                        "local_path": filepath # Keep track of exact local case/path
+                        "local_path": filepath
                     }
         return manifest
 
@@ -109,7 +108,7 @@ class SyncClient:
             "protocol": self.protocol
         })
         init_resp = recv_msg(self.secure_client)
-        
+
         if init_resp.get("status") != "ready":
             print(f"[-] Server rejected upload for {net_path}: {init_resp.get('msg')}")
             return False
@@ -117,7 +116,7 @@ class SyncClient:
         data_port = init_resp.get("data_port")
         sock_type = socket.SOCK_STREAM if self.protocol == "TCP" else socket.SOCK_DGRAM
         data_sock = socket.socket(socket.AF_INET, sock_type)
-        
+
         try:
             if self.protocol == "TCP":
                 data_sock.connect((SERVER_IP, data_port))
@@ -146,11 +145,11 @@ class SyncClient:
             if 'data_conn' in locals() and hasattr(data_conn, 'close'):
                 data_conn.close()
 
-        time.sleep(0.5) 
-        
+        time.sleep(0.5)
+
         send_msg(self.secure_client, {"cmd": "VERIFY_HASH", "filename": net_path})
         verify_resp = recv_msg(self.secure_client)
-        
+
         if verify_resp.get("status") == "success":
             if verify_resp.get("hash") == self.get_file_hash(local_path):
                 return True
@@ -167,7 +166,7 @@ class SyncClient:
             "protocol": self.protocol
         })
         init_resp = recv_msg(self.secure_client)
-        
+
         if init_resp.get("status") != "ready":
             print(f"[-] Server rejected download for {net_path}: {init_resp.get('msg')}")
             return False
@@ -236,9 +235,9 @@ class SyncClient:
         print("Sync Local Folder: Uploads new/modified files to the server. Will NOT delete files.")
         print("Restore All Files: Downloads all files currently saved on the server back to you.")
         print("Manage Server Files: View your remote archive and selectively delete files or folders to free up space.")
-        print("Manifest: A secure record of all your files. It contains the names, sizes, and a 'hash' (a digital fingerprint) to ensure files aren't corrupted.")
+        print("Manifest: A secure record of all your files. It contains the names, sizes, and a hash to ensure files aren't corrupted.")
         print("Deep Verification: Compares the digital fingerprints of your local files against the server to catch tampered or corrupted files.")
-        print("TCP vs RUDP: TCP is the standard, reliable internet protocol. RUDP is a custom experimental protocol.")
+        print("TCP vs RUDP: TCP is the standard, reliable internet protocol. RUDP is a custom experimental protocol made by us.")
         print("-" * 45)
 
     def menu(self):
@@ -280,7 +279,7 @@ class SyncClient:
                     total_mb = resp["quota"] / (1024*1024)
                     remaining_mb = max(0, total_mb - used_mb)
                     percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
-                    
+
                     print(f"\n--- STORAGE USAGE ---")
                     print(f"Used:      {used_mb:>7.2f} MB")
                     print(f"Remaining: {remaining_mb:>7.2f} MB")
@@ -304,7 +303,7 @@ class SyncClient:
         send_msg(self.secure_client, {"cmd": "GET_MANIFEST"})
         resp = recv_msg(self.secure_client)
         server_manifest = resp.get("manifest", {})
-        
+
         if not server_manifest:
             print("[-] No files currently stored on the server.")
             return
@@ -314,20 +313,20 @@ class SyncClient:
             size_mb = server_manifest[net_path]['size'] / (1024 * 1024)
             print(f" - {net_path} ({size_mb:.2f} MB)")
         print("-" * 20)
-        
+
         print("\nType the exact file path to delete it.")
         print("Type a folder path ending with '/' to delete the whole folder (e.g., 'photos/').")
         target = input("Target (or 'q' to cancel): ").strip()
-        
+
         if target.lower() == 'q' or not target:
             return
-            
+
         if target.endswith('/'):
             matches = [p for p in server_manifest.keys() if p.startswith(target.lower())]
             if not matches:
                 print(f"[-] No files found inside folder '{target}'.")
                 return
-                
+
             confirm = input(f"[!] WARNING: This will delete {len(matches)} files. Are you absolutely sure? (y/n): ").strip().lower()
             if confirm == 'y':
                 for net_path in matches:
@@ -343,7 +342,7 @@ class SyncClient:
             if target.lower() not in server_manifest:
                 print(f"[-] File '{target}' not found on server.")
                 return
-                
+
             confirm = input(f"[?] Are you sure you want to delete '{target}'? (y/n): ").strip().lower()
             if confirm == 'y':
                 send_msg(self.secure_client, {"cmd": "DELETE", "filename": target.lower()})
@@ -360,18 +359,18 @@ class SyncClient:
         send_msg(self.secure_client, {"cmd": "GET_MANIFEST"})
         resp = recv_msg(self.secure_client)
         server_manifest = resp.get("manifest", {})
-        
+
         local_manifest = self.get_local_manifest()
-        
+
         if not server_manifest and not local_manifest:
             print("[-] Both server and local directories are empty.")
             return
 
         print("\n--- DEEP MANIFEST VERIFICATION ---")
-        
+
         for net_path, local_data in local_manifest.items():
             server_data = server_manifest.get(net_path)
-            
+
             if not server_data:
                 print(f"[?] {net_path:<20} | LOCAL ONLY (Not backed up)")
             else:
@@ -390,7 +389,7 @@ class SyncClient:
         send_msg(self.secure_client, {"cmd": "GET_MANIFEST"})
         server_manifest = recv_msg(self.secure_client).get("manifest", {})
         local_manifest = self.get_local_manifest()
-        
+
         files_to_upload = []
         for net_path, local_data in local_manifest.items():
             server_data = server_manifest.get(net_path)
@@ -409,7 +408,7 @@ class SyncClient:
     def action_restore_all(self):
         send_msg(self.secure_client, {"cmd": "GET_MANIFEST"})
         server_manifest = recv_msg(self.secure_client).get("manifest", {})
-        
+
         if not server_manifest:
             print("[-] Nothing on the server to restore.")
             return

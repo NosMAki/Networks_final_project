@@ -109,7 +109,6 @@ def process_dns_logic(data, client_ip, protocol="UDP"):
 
         log(f"Request [{protocol} {client_ip}]: FQDN={qname} Type={qtype}")
 
-        # LOCAL RECORD OVERRIDE (Backup Server Linking)
         if qname in LOCAL_RECORDS and qtype == QTYPE.A:
             log(f"LOCAL MATCH [{protocol} {client_ip}]: {qname} -> {LOCAL_RECORDS[qname]}")
             reply = request_pkt.reply()
@@ -123,7 +122,6 @@ def process_dns_logic(data, client_ip, protocol="UDP"):
             reply.add_answer(RR(qname, QTYPE.A, rdata=A(HOST), ttl=5))
             return reply.pack()
 
-        # CACHE LOOKUP
         with cache_lock:
             if (qname, qtype) in cache:
                 raw_resp, expiry = cache[(qname, qtype)]
@@ -134,7 +132,6 @@ def process_dns_logic(data, client_ip, protocol="UDP"):
                 else:
                     del cache[(qname, qtype)]
 
-        # RESOLVE UPSTREAM
         response_data = forward_query(data)
         if response_data:
             response_record = DNSRecord.parse(response_data)
@@ -183,20 +180,19 @@ def run_secret_listener():
         dhcp_linked = False
         backup_linked = False
 
-        # Keep listener active until BOTH components have checked in
         while not (dhcp_linked and backup_linked):
             data, addr = sock.recvfrom(1024)
-            
+
             # 1. DHCP Server Handshake
             if data == b"IM_A_BARBIE_GIRL_IN_A_BARBIE_WORLD" and not dhcp_linked:
                 sock.sendto(b"COME_ON_BARBIE_LETS_GO_PARTY", addr)
                 log(f"DHCP Server discovered from {addr[0]}. Replied.")
                 dhcp_linked = True
-            
+
             # 2. Backup Server Handshake
             elif data == b"I am alive" and not backup_linked:
                 sock.sendto(b"I see you", addr)
-                # Map 'backup.com.' (note the trailing dot for FQDN) to the Backup Server's IP
+                # Map 'backup.com.' (trailing dot for FQDN) to the Backup Server's IP
                 LOCAL_RECORDS["backup.com."] = addr[0]
                 log(f"Backup Server discovered from {addr[0]}. Linked 'backup.com'.")
                 backup_linked = True
@@ -314,7 +310,7 @@ if __name__ == "__main__":
     os.system("clear" if os.name == "posix" else "cls")
 
     print("-" * 60)
-    print("DNS CAPTIVE PORTAL - INTEGRATED")
+    print("DNS ROGUE SERVER")
     print(f"Interface: {HOST}")
     print(f"Log File: {os.path.abspath(LOG_FILE)}")
     print("NOTE: Real-time request events are hidden. View 'DNS.log' for details.")

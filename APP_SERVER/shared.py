@@ -1,13 +1,12 @@
 import sys
 import os
 
-# This line tells Python to look in the parent directory so it can find 'transport'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import socket
 import json
 import struct
-from transport.rudp.rudp import RUDPSocket  # Added the import for our new RUDP class
+from transport.rudp.rudp import RUDPSocket
 
 CONTROL_PORT = 8443
 DATA_PORT_RANGE = (50000, 50050)
@@ -69,7 +68,7 @@ class TCPDataConnection(DataConnection):
 
 class RUDPDataConnection(DataConnection):
     def __init__(self, sock, is_server=False, dest_addr=None):
-        # Wrap the standard Python socket with our advanced RUDPSocket
+        # Wrap the standard Python socket with our super secret mega ultra advanced RUDPSocket
         self.rudp_sock = RUDPSocket(sock)
         if dest_addr:
             self.rudp_sock.set_destination(dest_addr)
@@ -81,7 +80,7 @@ class RUDPDataConnection(DataConnection):
         Because UDP is connectionless, receiving the first message (the token)
         is how the server learns the client's IP and port.
         """
-        # A UUID token is exactly 36 bytes long
+        # UUID token is exactly 36 bytes long
         token_bytes = self.rudp_sock.recvall(36)
         return token_bytes.decode('utf-8'), self.rudp_sock.dest_addr
 

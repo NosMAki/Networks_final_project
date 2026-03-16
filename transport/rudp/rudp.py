@@ -101,7 +101,7 @@ class RUDPSocket:
                                 acked_amount = ack_idx - base
                                 base = ack_idx
                                 self.dup_ack_count = 0
-                                
+
                                 if base >= total_chunks:
                                     break
 
