@@ -6,10 +6,19 @@ import hashlib
 import sys
 import signal
 import getpass
+import logging  # <-- Added logging import
 from tqdm import tqdm
 from shared import send_msg, recv_msg, TCPDataConnection, RUDPDataConnection, CONTROL_PORT, BUFFER_SIZE
 
-SERVER_IP = 'backup.com' # Change to your live server's IP when deploying
+# <-- Added this block to route all logs to a file instead of the terminal
+logging.basicConfig(
+    filename='rudp_transfer.log',
+    filemode='a',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+SERVER_IP = '10.0.0.114' # Change to your live server's IP when deploying
 
 class SyncClient:
     def __init__(self):

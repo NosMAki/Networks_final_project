@@ -27,7 +27,10 @@ def load_users():
     if not os.path.exists(DB_FILE):
         default_data = {
             "admin": {"password": "password123", "quota": DEFAULT_QUOTA},
-            "user1": {"password": "password123", "quota": 500 * 1024 * 1024} # 500 MB
+            "user1": {"password": "password123", "quota": 500 * 1024 * 1024}, # 500 MB
+            "dor_cohen": {"password": "pleasegiveus100", "quota": 500 * 1024 * 1024}, # 500 MB
+            "amit_dvir": {"password": "ilovethisserver", "quota": 500 * 1024 * 1024} # 500 MB
+
         }
         with open(DB_FILE, 'w') as f:
             json.dump(default_data, f, indent=4)
